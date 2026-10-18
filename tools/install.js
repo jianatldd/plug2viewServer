@@ -37,6 +37,22 @@ const files = {
   'camera/www/index.html': 'index.html', 'camera/install.sh': 'install.sh', 'camera/uninstall.sh': 'uninstall.sh',
 };
 if (fs.existsSync(path.join(root, 'camera/wifi.conf'))) files['camera/wifi.conf'] = 'wifi.conf'; // optional, holds a password
+// HTTPS key + self-signed certificate (EC P-256), generated once per camera into the
+// git-ignored camera/tls/ with openssl (Git for Windows ships one). Only pushed when present.
+const tlsDir = path.join(root, 'camera/tls');
+if (!fs.existsSync(path.join(tlsDir, 'key.der'))) {
+  try {
+    fs.mkdirSync(tlsDir, { recursive: true });
+    const run = (args) => spawnSync('openssl', args, { stdio: 'pipe' });
+    run(['ecparam', '-genkey', '-name', 'prime256v1', '-noout', '-out', path.join(tlsDir, 'key.pem')]);
+    run(['pkcs8', '-topk8', '-nocrypt', '-in', path.join(tlsDir, 'key.pem'), '-outform', 'DER', '-out', path.join(tlsDir, 'key.der')]);
+    run(['req', '-x509', '-new', '-key', path.join(tlsDir, 'key.pem'), '-days', '3650', '-subj', '/CN=plug2view camera',
+         '-addext', `subjectAltName=IP:${camera},DNS:plug2view`, '-outform', 'DER', '-out', path.join(tlsDir, 'cert.der')]);
+    if (fs.existsSync(path.join(tlsDir, 'cert.der'))) console.log('generated HTTPS key/certificate in camera/tls/');
+    else console.log('openssl not available: HTTPS key not generated (plain HTTP only)');
+  } catch (e) { console.log('HTTPS key generation skipped:', e.message); }
+}
+if (fs.existsSync(path.join(tlsDir, 'key.der'))) { files['camera/tls/key.der'] = 'key.der'; files['camera/tls/cert.der'] = 'cert.der'; }
 for (const [src, dst] of Object.entries(files)) {
   // Shell scripts must have LF line endings on the camera.
   const buf = fs.readFileSync(path.join(root, src));

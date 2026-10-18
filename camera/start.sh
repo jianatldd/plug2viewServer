@@ -23,7 +23,7 @@ start() {
     AUTH=""
     [ -n "$CREDENTIALS" ] && AUTH="-c $CREDENTIALS"
     pgrep camd >/dev/null || \
-        $BASE/bin/hkctl daemon $LOG $BASE/bin/camd -d ${H264_DEVICE:-/dev/video1} -j $DEVICE -p $PORT -l $PLFREQ -a ${CTL_PORT:-8081} -w $BASE/www -s ${SAVE_DIR:-/media/sda1/plug2view} $AUTH
+        $BASE/bin/hkctl daemon $LOG $BASE/bin/camd -d ${H264_DEVICE:-/dev/video1} -j $DEVICE -p $PORT -l $PLFREQ -a ${CTL_PORT:-8081} -w $BASE/www -s ${SAVE_DIR:-/media/sda1/plug2view} -t ${TLS_PORT:-8443} -C $BASE/tls/cert.der -K $BASE/tls/key.der $AUTH
     pgrep -f 'hkctl serve' >/dev/null || \
         $BASE/bin/hkctl daemon /tmp/hkctl.log $BASE/bin/hkctl serve ${CTL_PORT:-8081}
     # Motion detector (polls the Sonix hardware detector; saves frames to the SD card).

@@ -1,3 +1,5 @@
 # Local, machine/network-specific settings (camera address, Wi-Fi password) — never commit.
 config.local.json
 camera/wifi.conf
+# TLS key/certificate generated at install time for this camera
+camera/tls/

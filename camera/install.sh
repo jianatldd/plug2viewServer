@@ -27,6 +27,10 @@ get wifi.sh;      mv wifi.sh $BASE/wifi.sh;              chmod 755 $BASE/wifi.sh
 get wifi-dhcp.sh; mv wifi-dhcp.sh $BASE/wifi-dhcp.sh;    chmod 755 $BASE/wifi-dhcp.sh
 get sd.sh;        mv sd.sh $BASE/sd.sh;                  chmod 755 $BASE/sd.sh
 get index.html;   mv index.html $BASE/www/index.html
+mkdir -p $BASE/tls; rm -f /tmp/cert.der /tmp/key.der
+tftp -g -r cert.der "$PC" 2>/dev/null; tftp -g -r key.der "$PC" 2>/dev/null
+[ -s /tmp/cert.der ] && [ -s /tmp/key.der ] && mv /tmp/cert.der $BASE/tls/cert.der && mv /tmp/key.der $BASE/tls/key.der && chmod 600 $BASE/tls/key.der
+rm -f /tmp/cert.der /tmp/key.der
 [ -f $BASE/mjpg.conf ] || { get mjpg.conf; mv mjpg.conf $BASE/mjpg.conf; }
 # wifi.conf is optional (normally written from the web page); only replace the camera's
 # copy if the PC supplies one. Done in /tmp so a failed fetch can't touch $BASE/wifi.conf.

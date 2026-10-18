@@ -20,9 +20,9 @@
  *   /api/<...>               relayed to hkctl serve on localhost
  * With -c user:pass every URL needs HTTP basic auth (loopback is exempt).
  *
- * Build: zig cc -target mipsel-linux-musleabi -mcpu=mips32 -Os -static -s -o camd camd.c
+ * Build: zig cc -target mipsel-linux-musleabi -mcpu=mips32 -Os -static -s -o camd camd.c tls.c bearssl/libbearssl.a
  * Usage: camd [-d /dev/video1] [-j /dev/video0] [-p 8080] [-w /www] [-s /media/sda1/plug2view]
- *             [-c user:pass] [-l 60|50|0] [-a 8081]
+ *             [-c user:pass] [-l 60|50|0] [-a 8081] [-t 8443 -C cert.der -K key.der]   (HTTPS, optional)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +43,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <linux/videodev2.h>
+#include "tls.h"
 
 /* ---- old-kernel V4L2 buffer layout (musl has 64-bit time_t; the 2.6.21 driver wants
  * the classic 68-byte struct; the ioctl number encodes the size) --------------------- */
@@ -524,9 +525,10 @@ static void fmp4_fragment(struct bb *b, unsigned seqno, unsigned long long dts, 
 }
 
 /* ---- HTTP ----------------------------------------------------------------------- */
-enum phase { P_REQ, P_SEND, P_LIVE_WAIT, P_LIVE_SEND };
+enum phase { P_REQ, P_SEND, P_LIVE_WAIT, P_LIVE_SEND, P_CLOSING };
 struct client {
     int fd, local;
+    struct tlsconn *tls;                     /* non-NULL for HTTPS clients */
     enum phase phase;
     char req[2048]; int reqlen;
     unsigned char *body; size_t body_len, body_want;   /* POST body (browser-made JPEG for /?action=save) */
@@ -545,8 +547,25 @@ static int ctl_port = 8081;
 
 static void cli_close(struct client *c) {
     if (c->fd >= 0) close(c->fd);
+    if (c->tls) tls_free(c->tls);
     free(c->buf); free(c->body);
     memset(c, 0, sizeof *c); c->fd = -1;
+}
+
+/* Socket I/O through TLS when the client is HTTPS. Returns bytes, 0 = would block /
+ * nothing yet, -1 = closed or error. */
+static int cli_recv(struct client *c, void *buf, size_t n) {
+    if (c->tls) return tls_closed(c->tls) ? -1 : tls_recv(c->tls, buf, n);
+    ssize_t r = read(c->fd, buf, n);
+    if (r > 0) return (int)r;
+    if (r == 0) return -1;
+    return (errno == EAGAIN || errno == EINTR) ? 0 : -1;
+}
+static int cli_send(struct client *c, const void *p, size_t n) {
+    if (c->tls) return tls_closed(c->tls) ? -1 : tls_send(c->tls, p, n);
+    ssize_t w = write(c->fd, p, n);
+    if (w >= 0) return (int)w;
+    return (errno == EAGAIN || errno == EINTR) ? 0 : -1;
 }
 
 /* Save a JPEG (from the browser's decoded frame, or from jpeg_grab) under manual/. */
@@ -594,9 +613,14 @@ static void send_file_forked(struct client *c, const char *full) {
     if (fork() == 0) {
         alarm(900); fcntl(c->fd, F_SETFL, 0);
         char h[256]; int hl = snprintf(h, sizeof h, "HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Type: %s\r\nContent-Length: %ld\r\nCache-Control: max-age=86400\r\n\r\n", ctype_of(full), (long)len);
-        wr(c->fd, h, hl);
+        struct tlsio *tio = c->tls ? tls_blocking(c->tls) : NULL;
+        if (tio) tls_blocking_write(tio, h, hl); else wr(c->fd, h, hl);
         static unsigned char buf[16384]; ssize_t r;
-        while ((r = read(fd, buf, sizeof buf)) > 0) { size_t o = 0; ssize_t w; while (o < (size_t)r && (w = write(c->fd, buf + o, r - o)) > 0) o += w; if (o < (size_t)r) break; }
+        while ((r = read(fd, buf, sizeof buf)) > 0) {
+            if (tio) { if (tls_blocking_write(tio, buf, r) < 0) break; }
+            else { size_t o = 0; ssize_t w; while (o < (size_t)r && (w = write(c->fd, buf + o, r - o)) > 0) o += w; if (o < (size_t)r) break; }
+        }
+        if (tio) tls_blocking_finish(tio);
         _exit(0);
     }
     close(fd); cli_close(c);
@@ -607,17 +631,26 @@ static void proxy_api(struct client *c, const char *raw, int rawlen, const char 
     alarm(60);
     int s = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(ctl_port), .sin_addr.s_addr = htonl(0x7f000001) };
-    if (connect(s, (struct sockaddr *)&a, sizeof a) < 0) { const char *m = "HTTP/1.0 502 Bad Gateway\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"control API offline\"}"; write(c->fd, m, strlen(m)); _exit(0); }
     fcntl(c->fd, F_SETFL, 0);
+    struct tlsio *tio = c->tls ? tls_blocking(c->tls) : NULL;
+    if (connect(s, (struct sockaddr *)&a, sizeof a) < 0) {
+        const char *m = "HTTP/1.0 502 Bad Gateway\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"control API offline\"}";
+        if (tio) { tls_blocking_write(tio, m, strlen(m)); tls_blocking_finish(tio); } else write(c->fd, m, strlen(m));
+        _exit(0);
+    }
     char line[1200]; int n = snprintf(line, sizeof line, "%s %s HTTP/1.0\r\n", method, path); write(s, line, n);
     const char *hdrs = strstr(raw, "\r\n");
     if (hdrs) {
         write(s, hdrs + 2, rawlen - (hdrs + 2 - raw));
         const char *cl = strstr(raw, "Content-Length:"), *be = strstr(raw, "\r\n\r\n");
-        if (cl && be) { long want = atol(cl + 15), have = rawlen - (be + 4 - raw); char buf[1024]; while (have < want) { int r = read(c->fd, buf, sizeof buf); if (r <= 0) break; write(s, buf, r); have += r; } }
+        if (cl && be) {
+            long want = atol(cl + 15), have = rawlen - (be + 4 - raw); char buf[1024];
+            while (have < want) { int r = tio ? tls_blocking_read(tio, buf, sizeof buf) : (int)read(c->fd, buf, sizeof buf); if (r <= 0) break; write(s, buf, r); have += r; }
+        }
     }
     char buf[2048]; int r;
-    while ((r = read(s, buf, sizeof buf)) > 0) if (write(c->fd, buf, r) < 0) break;
+    while ((r = read(s, buf, sizeof buf)) > 0) { if (tio) { if (tls_blocking_write(tio, buf, r) < 0) break; } else if (write(c->fd, buf, r) < 0) break; }
+    if (tio) tls_blocking_finish(tio);
     _exit(0);
 }
 
@@ -682,7 +715,7 @@ static int cli_write(struct client *c) {
         } else return 0;
         if (left == 0) {
             if (c->phase == P_SEND) {
-                if (!c->live) return -1;
+                if (!c->live) return -2;            /* response complete */
                 c->phase = P_LIVE_WAIT; const struct hframe *f = live_next(c);
                 if (f) { live_prepare(c, f); continue; }
                 return 0;
@@ -690,8 +723,9 @@ static int cli_write(struct client *c) {
             if (c->live_hdr_off < 12) { c->live_hdr_off = 12; continue; }
             c->phase = P_LIVE_WAIT; const struct hframe *f = live_next(c); if (f) live_prepare(c, f); else return 0; continue;
         }
-        ssize_t n = write(c->fd, p, left);
-        if (n < 0) { if (errno == EAGAIN || errno == EINTR) return 0; return -1; }
+        int n = cli_send(c, p, left);
+        if (n < 0) return -1;
+        if (n == 0) return 0;                       /* would block (socket or TLS buffer full) */
         if (c->phase == P_SEND) c->off += n;
         else if (c->live_hdr_off < 12) c->live_hdr_off += n;
         else c->off += n;
@@ -699,6 +733,21 @@ static int cli_write(struct client *c) {
 }
 
 static int live_viewers(void) { int n = 0; for (int i = 0; i < MAXCLI; i++) if (cli[i].fd >= 0 && cli[i].live) n++; return n; }
+
+/* Response finished: plain sockets close now; TLS sends close_notify and lingers in
+ * P_CLOSING until the engine has flushed (otherwise the tail of the response is lost). */
+static void cli_finish(struct client *c) {
+    if (!c->tls) { cli_close(c); return; }
+    tls_close(c->tls); c->phase = P_CLOSING;
+    if (tls_pump(c->tls, 0, 1) < 0 || tls_flushed(c->tls)) cli_close(c);
+}
+/* Common tail after cli_write(): -1 error, -2 done, otherwise push TLS output. */
+static void cli_after_write(struct client *c, int r) {
+    if (c->fd < 0) return;
+    if (r == -1) cli_close(c);
+    else if (r == -2) cli_finish(c);
+    else if (c->tls && tls_pump(c->tls, 0, 1) < 0) cli_close(c);
+}
 
 static void handle_request(struct client *c) {
     char raw[sizeof c->req]; memcpy(raw, c->req, c->reqlen); int rawlen = c->reqlen;
@@ -836,9 +885,13 @@ static void b64(const char *in, char *out) {
 }
 
 int main(int argc, char **argv) {
-    const char *dev = "/dev/video1"; int port = 8080, plfreq = 60;
+    const char *dev = "/dev/video1"; int port = 8080, plfreq = 60, tls_port = 0;
+    const char *tls_cert = NULL, *tls_key = NULL;
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "-d")) dev = h264_dev = argv[i + 1];
+        else if (!strcmp(argv[i], "-t")) tls_port = atoi(argv[i + 1]);
+        else if (!strcmp(argv[i], "-C")) tls_cert = argv[i + 1];
+        else if (!strcmp(argv[i], "-K")) tls_key = argv[i + 1];
         else if (!strcmp(argv[i], "-j")) jpeg_dev = argv[i + 1];
         else if (!strcmp(argv[i], "-p")) port = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "-w")) www = argv[i + 1];
@@ -858,47 +911,70 @@ int main(int argc, char **argv) {
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = INADDR_ANY };
     if (bind(lfd, (struct sockaddr *)&a, sizeof a) < 0 || listen(lfd, 8) < 0) die("listen");
     fcntl(lfd, F_SETFL, O_NONBLOCK);
-    fprintf(stderr, "camd: %s H.264 1280x720 -> http port %d, www %s, recordings %s%s\n", dev, port, www, save_dir ? save_dir : "(disabled)", auth[0] ? ", auth on" : "");
+    /* optional HTTPS listener (BearSSL) */
+    int tfd = -1;
+    if (tls_port > 0 && tls_cert && tls_key && tls_init(tls_cert, tls_key) == 0) {
+        tfd = socket(AF_INET, SOCK_STREAM, 0); setsockopt(tfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        struct sockaddr_in ta = { .sin_family = AF_INET, .sin_port = htons(tls_port), .sin_addr.s_addr = INADDR_ANY };
+        if (bind(tfd, (struct sockaddr *)&ta, sizeof ta) < 0 || listen(tfd, 8) < 0) { perror("tls listen"); close(tfd); tfd = -1; }
+        else fcntl(tfd, F_SETFL, O_NONBLOCK);
+    }
+    fprintf(stderr, "camd: %s H.264 1280x720 -> http port %d%s, www %s, recordings %s%s\n", dev, port, tfd >= 0 ? " + https" : "", www, save_dir ? save_dir : "(disabled)", auth[0] ? ", auth on" : "");
+    if (tfd >= 0) fprintf(stderr, "camd: https on port %d\n", tls_port);
 
-    struct pollfd pf[MAXCLI + 2];
+    struct pollfd pf[MAXCLI + 3];
     for (;;) {
         int np = 0;
         pf[np].fd = vfd; pf[np].events = POLLIN; np++;
         pf[np].fd = lfd; pf[np].events = POLLIN; np++;
-        for (int i = 0; i < MAXCLI; i++) if (cli[i].fd >= 0) { pf[np].fd = cli[i].fd; pf[np].events = cli[i].phase == P_REQ ? POLLIN : cli[i].phase == P_LIVE_WAIT ? 0 : POLLOUT; np++; }
+        int tidx = -1; if (tfd >= 0) { tidx = np; pf[np].fd = tfd; pf[np].events = POLLIN; np++; }
+        int firstcli = np;
+        for (int i = 0; i < MAXCLI; i++) if (cli[i].fd >= 0) {
+            short ev = cli[i].phase == P_REQ ? POLLIN : (cli[i].phase == P_LIVE_WAIT || cli[i].phase == P_CLOSING) ? 0 : POLLOUT;
+            if (cli[i].tls) ev |= tls_want_events(cli[i].tls);
+            pf[np].fd = cli[i].fd; pf[np].events = ev; np++;
+        }
         if (poll(pf, np, 1000) < 0) { if (errno == EINTR) continue; die("poll"); }
         int k = 0;
         if (pf[k++].revents & POLLIN) {
             cam_grab();
             for (int i = 0; i < MAXCLI; i++) if (cli[i].fd >= 0 && cli[i].phase == P_LIVE_WAIT) {
                 const struct hframe *f = live_next(&cli[i]);
-                if (f) { live_prepare(&cli[i], f); if (cli_write(&cli[i]) < 0) cli_close(&cli[i]); }
+                if (f) { live_prepare(&cli[i], f); cli_after_write(&cli[i], cli_write(&cli[i])); }
             }
         }
-        if (pf[k++].revents & POLLIN) {
+        for (int li = 0; li < 2; li++) {
+            int lidx = li == 0 ? k : tidx; if (lidx < 0) continue;
+            if (!(pf[lidx].revents & POLLIN)) continue;
             struct sockaddr_in peer; socklen_t pl = sizeof peer;
-            int fd = accept(lfd, (struct sockaddr *)&peer, &pl);
-            if (fd >= 0) {
-                int j; for (j = 0; j < MAXCLI && cli[j].fd >= 0; j++);
-                if (j == MAXCLI) close(fd);
-                else { fcntl(fd, F_SETFL, O_NONBLOCK); setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); memset(&cli[j], 0, sizeof cli[j]); cli[j].fd = fd; cli[j].phase = P_REQ; cli[j].local = ntohl(peer.sin_addr.s_addr) == 0x7f000001; }
-            }
+            int fd = accept(pf[lidx].fd, (struct sockaddr *)&peer, &pl);
+            if (fd < 0) continue;
+            int j; for (j = 0; j < MAXCLI && cli[j].fd >= 0; j++);
+            if (j == MAXCLI) { close(fd); continue; }
+            fcntl(fd, F_SETFL, O_NONBLOCK); setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+            memset(&cli[j], 0, sizeof cli[j]); cli[j].fd = fd; cli[j].phase = P_REQ; cli[j].local = ntohl(peer.sin_addr.s_addr) == 0x7f000001;
+            if (li == 1) { cli[j].tls = tls_accept(fd); if (!cli[j].tls) { close(fd); cli[j].fd = -1; } }
         }
         for (int i = 0; i < MAXCLI; i++) if (cli[i].fd >= 0) {
-            struct pollfd *p = NULL; for (int m = 2; m < np; m++) if (pf[m].fd == cli[i].fd) { p = &pf[m]; break; }
+            struct pollfd *p = NULL; for (int m = firstcli; m < np; m++) if (pf[m].fd == cli[i].fd) { p = &pf[m]; break; }
             if (!p || !p->revents) continue;
             if (p->revents & (POLLERR | POLLHUP | POLLNVAL)) { cli_close(&cli[i]); continue; }
             struct client *c = &cli[i];
-            if (c->phase == P_REQ && (p->revents & POLLIN)) {
+            if (c->tls && tls_pump(c->tls, p->revents & POLLIN, p->revents & POLLOUT) < 0) { cli_close(c); continue; }
+            if (c->phase == P_CLOSING) { if (tls_flushed(c->tls)) cli_close(c); continue; }
+            if (c->phase == P_REQ && ((p->revents & POLLIN) || c->tls)) {
                 if (c->body) {                                   /* collecting a POST body */
-                    int n = read(c->fd, c->body + c->body_len, c->body_want - c->body_len);
-                    if (n <= 0) { if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue; cli_close(c); continue; }
+                    int n = cli_recv(c, c->body + c->body_len, c->body_want - c->body_len);
+                    if (n < 0) { cli_close(c); continue; }
+                    if (n == 0) { if (c->tls && tls_pump(c->tls, 0, 1) < 0) cli_close(c); continue; }
                     c->body_len += n;
-                    if (c->body_len == c->body_want) { handle_request(c); if (c->fd >= 0 && c->phase != P_REQ && cli_write(c) < 0) cli_close(c); }
+                    if (c->body_len == c->body_want) { handle_request(c); if (c->fd >= 0 && c->phase != P_REQ) cli_after_write(c, cli_write(c)); }
+                    else if (c->tls && tls_pump(c->tls, 0, 1) < 0) cli_close(c);
                     continue;
                 }
-                int n = read(c->fd, c->req + c->reqlen, sizeof c->req - 1 - c->reqlen);
-                if (n <= 0) { if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue; cli_close(c); continue; }
+                int n = cli_recv(c, c->req + c->reqlen, sizeof c->req - 1 - c->reqlen);
+                if (n < 0) { cli_close(c); continue; }
+                if (n == 0) { if (c->tls && tls_pump(c->tls, 0, 1) < 0) cli_close(c); continue; }
                 c->reqlen += n; c->req[c->reqlen] = 0;
                 char *hend = strstr(c->req, "\r\n\r\n");
                 if (hend && !strncmp(c->req, "POST ", 5) && strstr(c->req, "action=save")) {
@@ -908,12 +984,15 @@ int main(int argc, char **argv) {
                     c->body = malloc(want); c->body_want = want; c->body_len = c->reqlen - (hend + 4 - c->req);
                     if (!c->body) { cli_close(c); continue; }
                     memcpy(c->body, hend + 4, c->body_len); c->reqlen = hend + 4 - c->req; c->req[c->reqlen] = 0;
-                    if (c->body_len == c->body_want) { handle_request(c); if (c->fd >= 0 && c->phase != P_REQ && cli_write(c) < 0) cli_close(c); }
+                    if (c->body_len == c->body_want) { handle_request(c); if (c->fd >= 0 && c->phase != P_REQ) cli_after_write(c, cli_write(c)); }
                     continue;
                 }
-                if (hend) { handle_request(c); if (c->fd >= 0 && c->phase != P_REQ && cli_write(c) < 0) cli_close(c); }
+                if (hend) { handle_request(c); if (c->fd >= 0 && c->phase != P_REQ) cli_after_write(c, cli_write(c)); }
                 else if (c->reqlen >= (int)sizeof c->req - 1) cli_close(c);
-            } else if (p->revents & POLLOUT) { if (cli_write(c) < 0) cli_close(c); }
+                else if (c->tls && tls_pump(c->tls, 0, 1) < 0) cli_close(c);
+            } else if ((p->revents & POLLOUT) && c->phase != P_REQ && c->phase != P_LIVE_WAIT) {
+                cli_after_write(c, cli_write(c));
+            } else if (c->tls && c->fd >= 0 && tls_pump(c->tls, 0, 1) < 0) cli_close(c);
         }
         time_t now = time(NULL);
         if (last_frame_time && now - last_frame_time > 10) { fprintf(stderr, "no frames for 10 s, exiting for restart\n"); rec_stop(); exit(3); }
