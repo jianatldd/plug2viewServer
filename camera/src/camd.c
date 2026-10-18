@@ -854,6 +854,7 @@ static void handle_request(struct client *c) {
         send_file_forked(c, full);
         return;
     }
+    if (strstr(q, "action=")) { send_json(c, 404, "{\"error\":\"unknown action\"}"); return; }
     /* static file */
     if (strstr(path, "..")) { send_simple(c, 403, "text/plain", "Forbidden", NULL); return; }
     if (!strcmp(path, "/")) path = "/index.html";
