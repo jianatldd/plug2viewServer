@@ -596,13 +596,12 @@ static int cmd_motion(int argc, char **argv) {
             }
             active_until = now + MOTION_POSTROLL;
         }
-        /* One AVI per event: start (with pre-roll) on the first confirmed poll, append a
-         * frame on every poll (2/s) while active, close when the post-roll expires. */
+        /* One MP4 per event: camd records continuously between start (with pre-roll) and stop;
+         * the daemon only marks the beginning and the end of the event. */
         static int recording = 0;
         char resp[512];
         if (m.on && now < active_until) {
             if (started || !recording) { recording = local_get(port, "/?action=rec&start=1&tag=motion&pre=1", resp, sizeof resp); if (recording) saved++; }
-            else if (local_get(port, "/?action=rec&frame=1", resp, sizeof resp)) saved++;
             last_save = now;
         } else if (recording) {
             local_get(port, "/?action=rec&stop=1", resp, sizeof resp); recording = 0;
@@ -614,6 +613,39 @@ static int cmd_motion(int argc, char **argv) {
                          m.threshold, m.zones, m.confirm); fclose(f); }
         usleep(500000);                           /* 2 polls/s: ~1 s to trigger with confirm=2 */
     }
+}
+
+/* hkctl vidinfo <dev>: enumerate what a V4L2 device offers (formats, frame sizes,
+ * current format). Used to find out what /dev/video1 (the Sonix second stream) carries.
+ * These structs contain no time fields, so the header layouts match this old kernel. */
+#include <linux/videodev2.h>
+static int cmd_vidinfo(int argc, char **argv) {
+    if (argc < 3) return 1;
+    int fd = open(argv[2], O_RDWR | O_NONBLOCK);
+    if (fd < 0) { perror(argv[2]); return 2; }
+    struct v4l2_capability cap; memset(&cap, 0, sizeof cap);
+    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0)
+        printf("driver=%s card=%s bus=%s caps=0x%08x\n", cap.driver, cap.card, cap.bus_info, cap.capabilities);
+    for (unsigned i = 0; ; i++) {
+        struct v4l2_fmtdesc d; memset(&d, 0, sizeof d); d.index = i; d.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (ioctl(fd, VIDIOC_ENUM_FMT, &d) < 0) { if (i == 0) printf("ENUM_FMT: %s\n", strerror(errno)); break; }
+        unsigned p = d.pixelformat;
+        printf("format %u: %c%c%c%c (%s)%s\n", i, p & 255, p >> 8 & 255, p >> 16 & 255, p >> 24 & 255, d.description,
+               d.flags & V4L2_FMT_FLAG_COMPRESSED ? " compressed" : "");
+        for (unsigned j = 0; j < 32; j++) {
+            struct v4l2_frmsizeenum fs; memset(&fs, 0, sizeof fs); fs.index = j; fs.pixel_format = p;
+            if (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fs) < 0) { if (j == 0) printf("   (frame sizes: %s)\n", strerror(errno)); break; }
+            if (fs.type == V4L2_FRMSIZE_TYPE_DISCRETE) printf("   %ux%u\n", fs.discrete.width, fs.discrete.height);
+            else { printf("   %u-%u x %u-%u\n", fs.stepwise.min_width, fs.stepwise.max_width, fs.stepwise.min_height, fs.stepwise.max_height); break; }
+        }
+    }
+    struct v4l2_format f; memset(&f, 0, sizeof f); f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_G_FMT, &f) == 0) {
+        unsigned p = f.fmt.pix.pixelformat;
+        printf("current: %ux%u %c%c%c%c sizeimage=%u\n", f.fmt.pix.width, f.fmt.pix.height, p & 255, p >> 8 & 255, p >> 16 & 255, p >> 24 & 255, f.fmt.pix.sizeimage);
+    } else printf("G_FMT: %s\n", strerror(errno));
+    close(fd);
+    return 0;
 }
 
 /* hkctl daemon <logfile> <cmd> [args...]: run cmd fully detached (new session, no
@@ -638,6 +670,7 @@ int main(int argc, char **argv) {
     int rc = 1;
     if (argc >= 2) {
         if (!strcmp(argv[1], "daemon")) rc = cmd_daemon(argc, argv);
+        else if (!strcmp(argv[1], "vidinfo")) rc = cmd_vidinfo(argc, argv);
         else if (!strcmp(argv[1], "motion")) rc = cmd_motion(argc, argv);
         else if (!strcmp(argv[1], "serve")) rc = cmd_serve(argc, argv);
         else if (!strcmp(argv[1], "neck")) rc = cmd_neck(argc, argv);

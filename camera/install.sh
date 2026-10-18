@@ -5,7 +5,7 @@
 #   sh install.sh <pc-ip>
 #
 # Expects these files to be served by tools/tftp-server.js:
-#   mjpgd hkctl start.sh mjpg.conf 56mjpg.sh index.html wifi.sh wifi-dhcp.sh [wifi.conf]
+#   camd hkctl start.sh mjpg.conf 56mjpg.sh index.html wifi.sh wifi-dhcp.sh [wifi.conf]
 PC=$1
 [ -n "$PC" ] || { echo "usage: install.sh <pc-ip>"; exit 1; }
 BASE=/mnt/sif/owrt
@@ -14,13 +14,13 @@ get() { tftp -g -r "$1" "$PC" || { echo "tftp failed: $1"; exit 1; }; }
 
 # Make sure nothing is holding the sensor or the ports.
 rm -f /tmp/hk-watch/mjpg
-killall mjpgd mjpg_streamer hkctl 2>/dev/null
+killall camd mjpgd mjpg_streamer hkctl 2>/dev/null
 
 mkdir -p $BASE/bin $BASE/www && cd /tmp || exit 1
 # Leftovers from the mjpg-streamer based install (musl runtime, libjpeg) are no longer needed.
 rm -rf $BASE/lib $BASE/usr $BASE/etc /lib/ld-musl-mipsel-sf.so.1
 
-get mjpgd;        mv mjpgd $BASE/bin/mjpgd;              chmod 755 $BASE/bin/mjpgd
+get camd;         mv camd $BASE/bin/camd;                chmod 755 $BASE/bin/camd; rm -f $BASE/bin/mjpgd
 get hkctl;        mv hkctl $BASE/bin/hkctl;              chmod 755 $BASE/bin/hkctl
 get start.sh;     mv start.sh $BASE/start.sh;            chmod 755 $BASE/start.sh
 get wifi.sh;      mv wifi.sh $BASE/wifi.sh;              chmod 755 $BASE/wifi.sh
@@ -46,6 +46,6 @@ sync
 df /mnt/spinand
 $BASE/start.sh
 sleep 5
-cat /tmp/mjpgd.log
+cat /tmp/camd.log
 PORT=$(sed -n 's/^PORT=//p' $BASE/mjpg.conf)
-netstat -tln | grep -q ":${PORT:-8080} " && echo "OK: mjpgd is listening" || echo "WARNING: mjpgd not listening, check /tmp/mjpgd.log"
+netstat -tln | grep -q ":${PORT:-8080} " && echo "OK: camd is listening" || echo "WARNING: camd not listening, check /tmp/camd.log"

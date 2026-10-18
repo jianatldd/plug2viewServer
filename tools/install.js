@@ -31,7 +31,7 @@ const stage = path.join(os.tmpdir(), 'plug2view-tftp');
 fs.rmSync(stage, { recursive: true, force: true });
 fs.mkdirSync(stage, { recursive: true });
 const files = {
-  'camera/payload/mjpgd': 'mjpgd', 'camera/payload/hkctl': 'hkctl',
+  'camera/payload/camd': 'camd', 'camera/payload/hkctl': 'hkctl',
   'camera/start.sh': 'start.sh', 'camera/mjpg.conf': 'mjpg.conf', 'camera/56mjpg.sh': '56mjpg.sh',
   'camera/wifi.sh': 'wifi.sh', 'camera/wifi-dhcp.sh': 'wifi-dhcp.sh', 'camera/sd.sh': 'sd.sh',
   'camera/www/index.html': 'index.html', 'camera/install.sh': 'install.sh', 'camera/uninstall.sh': 'uninstall.sh',

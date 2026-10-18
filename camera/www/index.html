@@ -15,7 +15,8 @@
   button:active, a.btn:active { background: #3a3a3a; }
   button:disabled { opacity: .4; }
   main { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; position: relative; }
-  img { max-width: 100%; max-height: 100%; object-fit: contain; background: #000; }
+  img, canvas, video { max-width: 100%; max-height: 100%; object-fit: contain; background: #000; }
+  canvas, video { width: 100%; height: 100%; }
   /* pan/tilt pad overlaid on the picture, thumb-sized for phones */
   .player { display: flex; gap: 8px; align-items: center; background: #1b1b1b; padding: 6px 12px; border-top: 1px solid #333; flex-wrap: wrap; }
   .player[hidden] { display: none; }           /* display:flex above would defeat the hidden attribute */
@@ -116,7 +117,9 @@
   <button id="plClose">✕ Back to live</button>
 </div>
 <main>
-  <img id="v" alt="live stream">
+  <canvas id="cv" width="1280" height="720"></canvas>
+  <video id="vid" controls playsinline hidden></video>
+  <img id="v" alt="camera" hidden>
   <div class="pad" id="pad">
     <span></span><button data-dy="1" title="tilt">▲</button><span></span>
     <button data-dx="-1" title="pan">◀</button><button class="mid" id="center" title="centre">●</button><button data-dx="1" title="pan">▶</button>
@@ -131,35 +134,130 @@
   const CTL = '/api';
   const STEP = 120;  // steps per button press (~5 degrees of pan)
   const img = document.getElementById('v');
+  const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+  const vid = document.getElementById('vid');
   const status = document.getElementById('status');
   const info = document.getElementById('info');
   const ptz = document.getElementById('ptz');
   let live = false, range = null;
 
+  // ---- live view: H.264 in fragmented MP4 from /?action=fmp4, played through Media
+  // Source Extensions in a normal <video> element. (WebCodecs would need HTTPS; MSE works on
+  // plain HTTP.) Browsers without MSE (iPhones before iOS 17.1) get a 2 s snapshot refresh.
+  const MS = window.MediaSource || window.ManagedMediaSource;
+  const haveMse = !!MS;
+  let mse = { abort: null, ms: null, sb: null, url: null, retry: null, lastData: 0, queue: [], frames: 0, t0: 0 };
+  function showLive(el) { cv.hidden = el !== cv; img.hidden = el !== img; vid.hidden = el !== vid; }
+
+  function startMse() {
+    stopMse();
+    const ac = new AbortController();
+    const ms = new MS();
+    mse = { abort: ac, ms, sb: null, url: URL.createObjectURL(ms), retry: null, lastData: performance.now(), queue: [], frames: 0, t0: performance.now() };
+    vid.muted = true; vid.autoplay = true; vid.playsInline = true; vid.controls = false;
+    vid.src = mse.url;
+    ms.addEventListener('sourceopen', async () => {
+      try {
+        const r = await fetch('/?action=fmp4', { signal: ac.signal, cache: 'no-store' });
+        if (!r.ok || !r.body) throw new Error('http ' + r.status);
+        const codec = r.headers.get('X-Codec') || 'avc1.42401f';
+        const mime = `video/mp4; codecs="${codec}"`;
+        if (!MS.isTypeSupported(mime)) throw new Error('unsupported ' + mime);
+        const sb = ms.addSourceBuffer(mime); sb.mode = 'segments'; mse.sb = sb;
+        const pump = () => {
+          if (!sb.updating && mse.queue.length && ms.readyState === 'open') {
+            try { sb.appendBuffer(mse.queue.shift()); } catch (e) { console.error(e); scheduleRestart(); }
+          }
+        };
+        sb.addEventListener('updateend', () => {
+          // keep ~20 s of history at most; drop everything older
+          try {
+            if (!sb.updating && vid.buffered.length) {
+              const start = vid.buffered.start(0), end = vid.buffered.end(vid.buffered.length - 1);
+              if (end - start > 30) { sb.remove(start, end - 15); return; }
+            }
+          } catch (e) {}
+          pump();
+        });
+        const reader = r.body.getReader();
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          mse.lastData = performance.now();
+          mse.queue.push(value); pump();
+        }
+        if (live) scheduleRestart();
+      } catch (e) {
+        if (ac.signal.aborted) return;
+        console.error(e);
+        status.textContent = 'camera unreachable — retrying'; status.className = 'off';
+        if (live) scheduleRestart();
+      }
+    }, { once: true });
+    status.textContent = 'connecting…'; status.className = '';
+  }
+  function stopMse() {
+    clearTimeout(mse.retry);
+    if (mse.abort) { mse.abort.abort(); mse.abort = null; }
+    try { if (mse.ms && mse.ms.readyState === 'open') mse.ms.endOfStream(); } catch (e) {}
+    if (mse.url) { URL.revokeObjectURL(mse.url); mse.url = null; }
+    mse.queue = []; mse.sb = null; mse.ms = null;
+    vid.removeAttribute('src'); vid.load();
+  }
+  function scheduleRestart() { clearTimeout(mse.retry); mse.retry = setTimeout(() => { if (live) startMse(); }, 2000); }
+  // Stay at the live edge, keep playing, and restart if data or playback stalls.
+  setInterval(() => {
+    if (!live || !haveMse || !mse.abort) return;
+    const now = performance.now();
+    if (now - mse.lastData > 6000) { status.textContent = 'no video from camera — reconnecting'; status.className = 'off'; startMse(); return; }
+    try {
+      if (vid.buffered.length) {
+        const end = vid.buffered.end(vid.buffered.length - 1);
+        if (end - vid.currentTime > 2.5) vid.currentTime = end - 0.4;      // fell behind: jump to live
+        if (vid.paused && vid.readyState >= 2) vid.play().catch(() => {});
+      }
+    } catch (e) {}
+  }, 1000);
+  vid.addEventListener('error', () => { if (live && mse.abort) { status.textContent = 'video error — restarting'; status.className = 'off'; scheduleRestart(); } });
+  // fps readout from the video element's own frame callback
+  if (vid.requestVideoFrameCallback) {
+    const tick = () => { if (live && mse.abort) { mse.frames++; if (mse.frames % 15 === 0) { const s = (performance.now() - mse.t0) / 1000; status.textContent = `live · ${(mse.frames / s).toFixed(1)} fps`; status.className = ''; if (vid.videoWidth) info.textContent = vid.videoWidth + '×' + vid.videoHeight + ' H.264'; } } vid.requestVideoFrameCallback(tick); };
+    vid.requestVideoFrameCallback(tick);
+  } else {
+    vid.addEventListener('playing', () => { if (live) { status.textContent = 'live'; status.className = ''; if (vid.videoWidth) info.textContent = vid.videoWidth + '×' + vid.videoHeight + ' H.264'; } });
+  }
+  // Fallback for browsers without MSE: refresh a JPEG snapshot every 2 s.
+  let snapTimer = null;
+  function startSnapshots() { stopSnapshots(); const tick = () => { img.src = '?action=snapshot&t=' + Date.now(); }; tick(); snapTimer = setInterval(tick, 2000); status.textContent = 'live (snapshots — browser lacks Media Source Extensions)'; }
+  function stopSnapshots() { clearInterval(snapTimer); snapTimer = null; }
+
   function start() {
-    img.src = '?action=stream&t=' + Date.now();
     live = true;
     document.getElementById('pause').textContent = 'Pause';
-    status.textContent = 'live'; status.className = '';
+    if (haveMse) { showLive(vid); startMse(); } else { showLive(img); startSnapshots(); }
   }
   function stop() {
-    img.src = '?action=snapshot&t=' + Date.now();
     live = false;
+    stopMse(); stopSnapshots();
     document.getElementById('pause').textContent = 'Resume';
     status.textContent = 'paused';
   }
-  img.addEventListener('load', () => { if (img.naturalWidth) info.textContent = img.naturalWidth + '×' + img.naturalHeight; });
-  img.addEventListener('error', () => {
-    status.textContent = 'camera unreachable — retrying'; status.className = 'off';
-    if (live) setTimeout(start, 3000);
-  });
+  // Frame grab for Save: draw the current video frame onto the (hidden) canvas.
+  function grabFrameBlob() {
+    if (!vid.hidden && vid.videoWidth) {
+      cv.width = vid.videoWidth; cv.height = vid.videoHeight; ctx.drawImage(vid, 0, 0);
+      return new Promise(res => cv.toBlob(res, 'image/jpeg', 0.9));
+    }
+    return Promise.resolve(null);
+  }
+  img.addEventListener('load', () => { if (img.naturalWidth && !img.hidden) info.textContent = img.naturalWidth + '×' + img.naturalHeight; });
   document.getElementById('pause').onclick = () => (live ? stop() : start());
   document.getElementById('fs').onclick = () => {
     const el = document.querySelector('main');
     if (document.fullscreenElement) document.exitFullscreen();
     else if (el.requestFullscreen) el.requestFullscreen();
   };
-  document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); else if (document.getElementById('player').hidden) start(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { if (document.getElementById('player').hidden) stop(); } else if (document.getElementById('player').hidden) start(); });
 
   // ---- controls ----
   let busy = false;
@@ -277,9 +375,18 @@
   };
 
   // ---- SD card: manual save, motion detection, recordings browser ----
+  // Save: the live frame is already decoded on the canvas, so the browser makes the JPEG
+  // and uploads it (the camera cannot open its MJPEG stream while H.264 is running).
   document.getElementById('save').onclick = async () => {
     try {
-      const j = await (await fetch('/?action=save&tag=manual', { cache: 'no-store' })).json();
+      let r;
+      const blob = await grabFrameBlob();
+      if (blob) {
+        r = await fetch('/?action=save', { method: 'POST', body: blob, headers: { 'Content-Type': 'image/jpeg' } });
+      } else {
+        r = await fetch('/?action=save&tag=manual', { cache: 'no-store' });
+      }
+      const j = await r.json();
       ptz.className = j.saved ? '' : 'off';
       ptz.textContent = j.saved ? 'saved ' + j.saved : (j.error || 'save failed');
     } catch (e) { ptz.textContent = 'save failed'; ptz.className = 'off'; }
@@ -358,8 +465,10 @@
           span.onclick = () => loadRecs(rel);
           li.appendChild(span);
         } else {
-          const a = document.createElement('a'); a.href = '/rec/' + rel; a.textContent = (e.name.endsWith('.avi') ? '🎬 ' : '🖼 ') + e.name;
-          if (e.name.endsWith('.avi')) { a.onclick = (ev) => { ev.preventDefault(); playAvi('/rec/' + rel, e.name); }; a.title = 'play here (right-click → save to download)'; }
+          const isVideo = e.name.endsWith('.avi') || e.name.endsWith('.mp4');
+          const a = document.createElement('a'); a.href = '/rec/' + rel; a.textContent = (isVideo ? '🎬 ' : '🖼 ') + e.name;
+          if (e.name.endsWith('.mp4')) { a.onclick = (ev) => { ev.preventDefault(); playMp4('/rec/' + rel, e.name); }; a.title = 'play here (right-click → save to download)'; }
+          else if (e.name.endsWith('.avi')) { a.onclick = (ev) => { ev.preventDefault(); playAvi('/rec/' + rel, e.name); }; a.title = 'play here (right-click → save to download)'; }
           else a.target = '_blank';
           li.appendChild(a);
           const sz = document.createElement('span'); sz.className = 'sz'; sz.textContent = e.size > 1048576 ? (e.size / 1048576).toFixed(1) + ' MB' : Math.round(e.size / 1024) + ' KB';
@@ -403,8 +512,17 @@
     walk(12, buf.byteLength);
     return { frames, fps };
   }
+  // MP4 recordings play in the browser's own <video>; AVI (older recordings) use the JS stepper below.
+  function playMp4(url, name) {
+    stopPlayer(); stop();
+    player.hidden = false; document.getElementById('plName').textContent = name;
+    document.getElementById('plPlay').hidden = true; document.getElementById('plSeek').hidden = true; document.getElementById('plTime').hidden = true;
+    showLive(vid); vid.controls = true; vid.muted = false; vid.src = url; vid.play().catch(() => {});
+  }
   async function playAvi(url, name) {
     stopPlayer(); stop();                                   // pause the live stream while playing
+    document.getElementById('plPlay').hidden = false; document.getElementById('plSeek').hidden = false; document.getElementById('plTime').hidden = false;
+    showLive(img);
     player.hidden = false; document.getElementById('plName').textContent = name + ' — loading…';
     try {
       const buf = await (await fetch(url, { cache: 'force-cache' })).arrayBuffer();
@@ -430,7 +548,7 @@
     if (playing) pl.timer = setInterval(() => { if (pl.i >= pl.frames.length - 1) { playPause(false); return; } showFrame(pl.i + 1); }, 1000 / pl.fps);
     document.getElementById('plPlay').textContent = playing ? '❚❚' : '▶';
   }
-  function stopPlayer() { clearInterval(pl.timer); pl = { frames: [], i: 0, timer: null, fps: 2, url: null }; player.hidden = true; }
+  function stopPlayer() { clearInterval(pl.timer); pl = { frames: [], i: 0, timer: null, fps: 2, url: null }; player.hidden = true; vid.pause(); vid.removeAttribute('src'); vid.load(); }
   document.getElementById('plPlay').onclick = () => playPause();
   document.getElementById('plSeek').oninput = (e) => { playPause(false); showFrame(parseInt(e.target.value, 10)); };
   document.getElementById('plClose').onclick = () => { stopPlayer(); start(); };
