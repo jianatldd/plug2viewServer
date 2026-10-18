@@ -1,0 +1,13 @@
+{
+  "name": "plug2view",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Revive a Plug2View (HK/uipcam) IP camera after its cloud app died: serve MJPEG over HTTP from the camera itself.",
+  "scripts": {
+    "install-camera": "node tools/install.js",
+    "uninstall-camera": "node tools/install.js --uninstall",
+    "shell": "node tools/camera-shell.js",
+    "tftp": "node tools/tftp-server.js camera/payload 69"
+  },
+  "engines": { "node": ">=18" }
+}

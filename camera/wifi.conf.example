@@ -1,0 +1,9 @@
+# Copy to camera/wifi.conf (kept out of docs; contains your Wi-Fi password) and run
+# `node tools/install.js`. The camera radio is 2.4 GHz b/g/n only.
+#
+# AUTH: WPA2PSK (most home routers), WPAPSK, or OPEN
+# ENC:  AES (with WPA2PSK), TKIP (old WPA), or NONE (with OPEN)
+SSID=MyHomeWifi
+PASS=secret-passphrase
+AUTH=WPA2PSK
+ENC=AES

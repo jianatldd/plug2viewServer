@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Plug2View Camera</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 14px system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: #1b1b1b; flex-wrap: wrap; }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0 auto 0 0; }
+  button, a.btn { background: #2d2d2d; color: #eee; border: 1px solid #444; border-radius: 6px; padding: 6px 10px; font: inherit; text-decoration: none; cursor: pointer; }
+  button:active, a.btn:active { background: #3a3a3a; }
+  button:disabled { opacity: .4; }
+  main { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; position: relative; }
+  img { max-width: 100%; max-height: 100%; object-fit: contain; background: #000; }
+  /* pan/tilt pad overlaid on the picture, thumb-sized for phones */
+  .player { display: flex; gap: 8px; align-items: center; background: #1b1b1b; padding: 6px 12px; border-top: 1px solid #333; flex-wrap: wrap; }
+  .player[hidden] { display: none; }           /* display:flex above would defeat the hidden attribute */
+  .player input[type=range] { flex: 1; min-width: 8em; }
+  .pad { position: absolute; right: 12px; bottom: 12px; display: grid; grid-template-columns: repeat(3, 44px); gap: 4px; opacity: .85; }
+  .pad button { width: 44px; height: 44px; font-size: 18px; padding: 0; }
+  .pad .mid { font-size: 12px; }
+  footer { padding: 6px 12px; font-size: 12px; color: #888; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  #wifiPanel, #recPanel, #motionPanel { background: #1b1b1b; padding: 8px 12px; border-top: 1px solid #333; max-height: 45vh; overflow: auto; }
+  #wifiPanel .row, #recPanel .row, #motionPanel .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 4px 0; }
+  #motionPanel label { display: flex; gap: 6px; align-items: center; }
+  #motionPanel input[type=number] { background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 3px 4px; font: inherit; }
+  .zones { display: grid; grid-template-columns: repeat(3, 44px); gap: 3px; }
+  .zones button { width: 44px; height: 30px; padding: 0; font-size: 12px; color: #666; background: #222; }
+  .zones button.on { color: #eee; background: #2d5a2d; border-color: #4a8a4a; }
+  .zones button.hot { background: #a85a1a; border-color: #e88; color: #fff; }
+  #wifiPanel ul, #recPanel ul { list-style: none; margin: 6px 0; padding: 0; }
+  #wifiPanel li, #recPanel li { display: flex; gap: 10px; padding: 6px 4px; border-bottom: 1px solid #2a2a2a; cursor: pointer; }
+  #wifiPanel li:hover, #recPanel li:hover { background: #262626; }
+  #recPanel li a { color: #9cf; text-decoration: none; }
+  #recPanel li .sz { color: #888; margin-left: auto; font-size: 12px; }
+  #recPanel li .del { padding: 2px 8px; margin-left: 8px; }
+  #recPanel li a + .sz + .del, #recPanel li span + .del { margin-left: 8px; }
+  #motion.on { background: #2d5a2d; border-color: #4a8a4a; }
+  #motion.rec { background: #7a2525; border-color: #c44; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: .55; } }
+  #wifiPanel li .sig { width: 3.5em; color: #9c9; }
+  #wifiPanel li .sec { color: #888; margin-left: auto; font-size: 12px; }
+  #wifiPanel input { background: #111; color: #eee; border: 1px solid #444; border-radius: 6px; padding: 6px 8px; font: inherit; flex: 1; min-width: 10em; }
+  .hint { color: #777; font-size: 12px; margin: 6px 0 0; }
+  .off { color: #e66; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Plug2View Camera</h1>
+  <button id="pause">Pause</button>
+  <a class="btn" id="snap" href="?action=snapshot" target="_blank">Snapshot</a>
+  <button id="save" title="save the current frame to the SD card">Save</button>
+  <button id="motion" title="motion-triggered saving to the SD card">Motion: …</button>
+  <button id="motionCfg" title="motion sensitivity and zones">⚙</button>
+  <button id="recs">Recordings</button>
+  <button id="wifi">Wi-Fi</button>
+  <button id="fs">Full screen</button>
+</header>
+<section id="motionPanel" hidden>
+  <div class="row">
+    <b>Motion detection</b>
+    <span id="mInfo" class="hint"></span>
+    <button id="mClose" style="margin-left:auto">✕ Close</button>
+  </div>
+  <div class="row">
+    <label>Sensitivity <input id="mSens" type="range" min="1" max="10" step="1"></label>
+    <span id="mSensVal"></span>
+    <label>threshold <input id="mThr" type="number" min="0" max="65535" style="width:6em"></label>
+    <label>confirm polls <input id="mConf" type="number" min="1" max="10" style="width:3em"></label>
+  </div>
+  <div class="row" style="align-items:flex-start">
+    <div class="zones" id="zones"></div>
+    <p class="hint" style="margin:0;max-width:30em">Zones map onto the picture (3×3). Click a zone to include/exclude it;
+      zones currently reporting motion flash orange, so you can see which one triggers falsely and switch it off.
+      Lower sensitivity (higher threshold) ignores small changes such as light flicker.</p>
+  </div>
+</section>
+<section id="recPanel" hidden>
+  <div class="row">
+    <span id="recPath">recordings</span>
+    <button id="recUp">↑ Up</button>
+    <button id="recRefresh">Refresh</button>
+    <span id="recInfo"></span>
+    <button id="recClose" style="margin-left:auto">✕ Close</button>
+  </div>
+  <ul id="recList"></ul>
+</section>
+<section id="wifiPanel" hidden>
+  <div class="row">
+    <button id="scan">Scan networks</button>
+    <span id="wifiState"></span>
+    <button id="wifiClose" title="close" style="margin-left:auto">✕ Close</button>
+  </div>
+  <ul id="nets"></ul>
+  <form id="joinForm" hidden>
+    <div class="row">Join <b id="joinSsid"></b> <span id="joinSec"></span></div>
+    <div class="row">
+      <input id="joinPass" type="password" placeholder="Wi-Fi password" autocomplete="off">
+      <button type="submit">Join</button>
+      <button type="button" id="joinCancel">Cancel</button>
+    </div>
+  </form>
+  <p class="hint">After joining, the camera gets a <em>second</em> address on Wi-Fi (shown above). Use that
+  address once you unplug the network cable, and reserve it in your router so it stays fixed.</p>
+</section>
+<div id="player" class="player" hidden>
+  <button id="plPlay">▶</button>
+  <input id="plSeek" type="range" min="0" max="0" value="0">
+  <span id="plTime">0.0 s</span>
+  <span id="plName" class="hint"></span>
+  <button id="plClose">✕ Back to live</button>
+</div>
+<main>
+  <img id="v" alt="live stream">
+  <div class="pad" id="pad">
+    <span></span><button data-dy="1" title="tilt">▲</button><span></span>
+    <button data-dx="-1" title="pan">◀</button><button class="mid" id="center" title="centre">●</button><button data-dx="1" title="pan">▶</button>
+    <span></span><button data-dy="-1" title="tilt">▼</button><span></span>
+  </div>
+</main>
+<footer><span id="status">connecting…</span><span id="ptz"></span><span id="info"></span></footer>
+<script>
+  // Video comes from mjpg-streamer on this origin (?action=stream / ?action=snapshot).
+  // Pan/tilt, IR-cut and Wi-Fi calls go to /api/..., which mjpgd relays to `hkctl serve`
+  // on the camera's localhost — same origin, same (optional) password, one port to forward.
+  const CTL = '/api';
+  const STEP = 120;  // steps per button press (~5 degrees of pan)
+  const img = document.getElementById('v');
+  const status = document.getElementById('status');
+  const info = document.getElementById('info');
+  const ptz = document.getElementById('ptz');
+  let live = false, range = null;
+
+  function start() {
+    img.src = '?action=stream&t=' + Date.now();
+    live = true;
+    document.getElementById('pause').textContent = 'Pause';
+    status.textContent = 'live'; status.className = '';
+  }
+  function stop() {
+    img.src = '?action=snapshot&t=' + Date.now();
+    live = false;
+    document.getElementById('pause').textContent = 'Resume';
+    status.textContent = 'paused';
+  }
+  img.addEventListener('load', () => { if (img.naturalWidth) info.textContent = img.naturalWidth + '×' + img.naturalHeight; });
+  img.addEventListener('error', () => {
+    status.textContent = 'camera unreachable — retrying'; status.className = 'off';
+    if (live) setTimeout(start, 3000);
+  });
+  document.getElementById('pause').onclick = () => (live ? stop() : start());
+  document.getElementById('fs').onclick = () => {
+    const el = document.querySelector('main');
+    if (document.fullscreenElement) document.exitFullscreen();
+    else if (el.requestFullscreen) el.requestFullscreen();
+  };
+  document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); else if (document.getElementById('player').hidden) start(); });
+
+  // ---- controls ----
+  let busy = false;
+  async function ctl(path) {
+    if (busy) return;
+    busy = true;
+    document.querySelectorAll('.pad button').forEach(b => b.disabled = true);
+    try {
+      const r = await fetch(CTL + path, { cache: 'no-store' });
+      const j = await r.json();
+      showPtz(j);
+      return j;
+    } catch (e) {
+      ptz.textContent = 'control API offline'; ptz.className = 'off';
+    } finally {
+      busy = false;
+      document.querySelectorAll('.pad button').forEach(b => b.disabled = false);
+    }
+  }
+  function showPtz(j) {
+    if (j.range) range = j.range;
+    ptz.className = '';
+    ptz.textContent = j.known === false ? 'position unknown — hold ● to home' : (j.x !== undefined ? `pan ${j.x} tilt ${j.y}` : '');
+  }
+  document.querySelectorAll('.pad button[data-dx], .pad button[data-dy]').forEach(b => {
+    b.onclick = () => ctl(`/ptz?dx=${(b.dataset.dx || 0) * STEP}&dy=${(b.dataset.dy || 0) * STEP}`);
+  });
+  // ● tap: go to the saved default view. Double-tap: save the current view as default.
+  // Long-press (1.5 s): re-home against the limit switches, then return to the default view.
+  const center = document.getElementById('center');
+  let hold, lastTap = 0;
+  const down = () => { hold = setTimeout(() => { hold = null; ptz.textContent = 'homing…'; ctl('/ptz?home=1'); }, 1500); };
+  const up = () => {
+    if (!hold) return;
+    clearTimeout(hold); hold = null;
+    const now = Date.now();
+    if (now - lastTap < 400) { lastTap = 0; ctl('/ptz?setpark=1').then(j => { if (j) ptz.textContent = `default view saved (pan ${j.x} tilt ${j.y})`; }); }
+    else { lastTap = now; setTimeout(() => { if (lastTap === now) ctl('/ptz?park=1'); }, 400); }
+  };
+  center.addEventListener('pointerdown', down); center.addEventListener('pointerup', up); center.addEventListener('pointerleave', () => { if (hold) { clearTimeout(hold); hold = null; } });
+  center.title = 'tap: default view · double-tap: save current view as default · hold: re-home';
+  // (No Day/Night buttons: this hardware variant has no software-controlled IR-cut filter;
+  //  night vision is handled by the photoresistor circuit. /api/ircut remains for testing.)
+  // Arrow keys on a PC.
+  document.addEventListener('keydown', (e) => {
+    const m = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] }[e.key];
+    if (m) { e.preventDefault(); ctl(`/ptz?dx=${m[0] * STEP}&dy=${m[1] * STEP}`); }
+  });
+
+  // ---- Wi-Fi setup ----
+  const panel = document.getElementById('wifiPanel');
+  const nets = document.getElementById('nets');
+  const wifiState = document.getElementById('wifiState');
+  const joinForm = document.getElementById('joinForm');
+  let pick = null, statusTimer = null;
+
+  async function wifiStatus() {
+    try {
+      const j = await (await fetch(CTL + '/wifi/status', { cache: 'no-store' })).json();
+      const conn = /Connected/i.test(j.state);
+      wifiState.textContent = j.ssid
+        ? `${j.ssid}: ${conn ? 'connected' : j.state || 'not connected'}${j.wifi_ip ? ' — Wi-Fi address ' + j.wifi_ip : ''}`
+        : 'Wi-Fi not configured';
+      wifiState.className = conn ? '' : 'off';
+      return conn;
+    } catch (e) { wifiState.textContent = 'control API offline'; wifiState.className = 'off'; }
+  }
+  document.getElementById('wifi').onclick = () => {
+    panel.hidden = !panel.hidden;
+    if (!panel.hidden) wifiStatus();
+  };
+  document.getElementById('wifiClose').onclick = () => { panel.hidden = true; };
+  document.getElementById('scan').onclick = async () => {
+    nets.innerHTML = '<li>scanning (5 s)…</li>';
+    joinForm.hidden = true;
+    try {
+      const list = await (await fetch(CTL + '/wifi/scan', { cache: 'no-store' })).json();
+      list.sort((a, b) => b.signal - a.signal);
+      nets.innerHTML = '';
+      const seen = new Set();
+      for (const n of list) {
+        if (seen.has(n.ssid)) continue;           // one entry per SSID (mesh routers repeat)
+        seen.add(n.ssid);
+        const li = document.createElement('li');
+        li.innerHTML = `<span class="sig">${n.signal}%</span><span></span><span class="sec">${n.security} · ch ${n.ch}</span>`;
+        li.children[1].textContent = n.ssid;
+        li.onclick = () => {
+          pick = n;
+          document.getElementById('joinSsid').textContent = n.ssid;
+          document.getElementById('joinSec').textContent = n.security;
+          document.getElementById('joinPass').value = '';
+          document.getElementById('joinPass').disabled = /NONE|OPEN/.test(n.security);
+          joinForm.hidden = false;
+          document.getElementById('joinPass').focus();
+        };
+        nets.appendChild(li);
+      }
+      if (!list.length) nets.innerHTML = '<li>no networks found</li>';
+    } catch (e) { nets.innerHTML = '<li class="off">scan failed</li>'; }
+  };
+  document.getElementById('joinCancel').onclick = () => { joinForm.hidden = true; };
+  joinForm.onsubmit = async (e) => {
+    e.preventDefault();
+    if (!pick) return;
+    const body = new URLSearchParams({ ssid: pick.ssid, pass: document.getElementById('joinPass').value, security: pick.security });
+    joinForm.hidden = true;
+    wifiState.textContent = `joining ${pick.ssid}…`; wifiState.className = '';
+    try {
+      await fetch(CTL + '/wifi/join', { method: 'POST', body, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+    } catch (err) { wifiState.textContent = 'join request failed'; wifiState.className = 'off'; return; }
+    // Association + DHCP take 10-30 s; poll until connected or give up after 60 s.
+    clearInterval(statusTimer);
+    let tries = 0;
+    statusTimer = setInterval(async () => { if (await wifiStatus() || ++tries > 20) clearInterval(statusTimer); }, 3000);
+  };
+
+  // ---- SD card: manual save, motion detection, recordings browser ----
+  document.getElementById('save').onclick = async () => {
+    try {
+      const j = await (await fetch('/?action=save&tag=manual', { cache: 'no-store' })).json();
+      ptz.className = j.saved ? '' : 'off';
+      ptz.textContent = j.saved ? 'saved ' + j.saved : (j.error || 'save failed');
+    } catch (e) { ptz.textContent = 'save failed'; ptz.className = 'off'; }
+  };
+  const motionBtn = document.getElementById('motion');
+  // Sensitivity slider 1 (least) .. 10 (most) -> detector threshold (higher = less sensitive).
+  const THR = [3000, 2000, 1400, 900, 600, 400, 273, 200, 150, 100];
+  const mPanel = document.getElementById('motionPanel');
+  const zonesEl = document.getElementById('zones');
+  let zoneMask = 511, cfgKnown = false;
+  for (let z = 0; z < 9; z++) {
+    const b = document.createElement('button'); b.textContent = z + 1; b.dataset.z = z;
+    b.onclick = () => { zoneMask ^= (1 << z); ctl('/motion?zones=' + zoneMask).then(renderMotionCfg); };
+    zonesEl.appendChild(b);
+  }
+  function renderMotionCfg(j) {
+    if (!j || j.threshold === undefined) return;
+    cfgKnown = true; zoneMask = j.zones;
+    const live = (j.state && j.state.mask) || 0;
+    [...zonesEl.children].forEach((b, z) => {
+      b.className = (live & (1 << z)) ? 'hot' : (zoneMask & (1 << z)) ? 'on' : '';
+    });
+    document.getElementById('mThr').value = j.threshold;
+    document.getElementById('mConf').value = j.confirm;
+    let s = 1; for (let i = 0; i < THR.length; i++) if (j.threshold <= THR[i]) s = i + 1;
+    document.getElementById('mSens').value = s;
+    document.getElementById('mSensVal').textContent = s + '/10';
+    document.getElementById('mInfo').textContent = `${j.state ? j.state.events : 0} events, ${j.state ? j.state.saved : 0} frames saved since start`;
+  }
+  document.getElementById('mSens').oninput = (e) => { document.getElementById('mSensVal').textContent = e.target.value + '/10'; };
+  document.getElementById('mSens').onchange = (e) => ctl('/motion?threshold=' + THR[e.target.value - 1]).then(renderMotionCfg);
+  document.getElementById('mThr').onchange = (e) => ctl('/motion?threshold=' + parseInt(e.target.value || 273, 10)).then(renderMotionCfg);
+  document.getElementById('mConf').onchange = (e) => ctl('/motion?confirm=' + parseInt(e.target.value || 2, 10)).then(renderMotionCfg);
+  document.getElementById('motionCfg').onclick = () => { mPanel.hidden = !mPanel.hidden; if (!mPanel.hidden) motionStatus(); };
+  document.getElementById('mClose').onclick = () => { mPanel.hidden = true; };
+
+  async function motionStatus(toggleTo) {
+    const j = await ctl('/motion' + (toggleTo === undefined ? '' : '?enable=' + toggleTo));
+    if (!j) return;
+    renderMotionCfg(j);
+    const on = j.config_enabled, rec = on && j.state && j.state.active;
+    // green = armed (watching), red + blinking = motion seen, frames being saved right now
+    motionBtn.textContent = rec ? 'Recording ●' : 'Motion: ' + (on ? 'On' : 'Off');
+    motionBtn.title = rec ? 'motion detected — saving one frame per second to the SD card'
+                    : on ? 'armed: will record to the SD card when motion is detected (click to disarm)'
+                         : 'motion detection off (click to arm)';
+    motionBtn.className = rec ? 'rec' : on ? 'on' : '';
+    motionBtn.dataset.on = on ? 1 : 0;
+  }
+  motionBtn.onclick = () => motionStatus(motionBtn.dataset.on === '1' ? 0 : 1);
+  // Poll every 2 s while armed (1 s with the settings panel open), 10 s when off.
+  setInterval(() => {
+    if (document.hidden || busy) return;
+    const armed = motionBtn.dataset.on === '1';
+    const t = Date.now();
+    if (!mPanel.hidden || (armed && t % 2000 < 1000) || (!armed && t % 10000 < 1000)) motionStatus();
+  }, 1000);
+
+  const recPanel = document.getElementById('recPanel');
+  const recList = document.getElementById('recList');
+  let recDir = '';
+  async function loadRecs(dir) {
+    recDir = dir;
+    document.getElementById('recPath').textContent = 'recordings/' + dir;
+    recList.innerHTML = '<li>loading…</li>';
+    try {
+      const j = await (await fetch('/files?dir=' + encodeURIComponent(dir), { cache: 'no-store' })).json();
+      const items = j.entries.sort((a, b) => (b.dir - a.dir) || b.name.localeCompare(a.name));   // folders first, newest first
+      recList.innerHTML = '';
+      document.getElementById('recInfo').textContent = items.length + ' item' + (items.length === 1 ? '' : 's');
+      for (const e of items) {
+        const li = document.createElement('li');
+        const rel = (dir ? dir + '/' : '') + e.name;
+        if (e.dir) {
+          const span = document.createElement('span'); span.textContent = '📁 ' + e.name; span.style.flex = '1';
+          span.onclick = () => loadRecs(rel);
+          li.appendChild(span);
+        } else {
+          const a = document.createElement('a'); a.href = '/rec/' + rel; a.textContent = (e.name.endsWith('.avi') ? '🎬 ' : '🖼 ') + e.name;
+          if (e.name.endsWith('.avi')) { a.onclick = (ev) => { ev.preventDefault(); playAvi('/rec/' + rel, e.name); }; a.title = 'play here (right-click → save to download)'; }
+          else a.target = '_blank';
+          li.appendChild(a);
+          const sz = document.createElement('span'); sz.className = 'sz'; sz.textContent = e.size > 1048576 ? (e.size / 1048576).toFixed(1) + ' MB' : Math.round(e.size / 1024) + ' KB';
+          li.appendChild(sz);
+        }
+        // Delete: allowed for day folders and files (not the top-level manual/motion folders).
+        if (dir) {
+          const del = document.createElement('button'); del.textContent = '🗑'; del.title = 'delete'; del.className = 'del';
+          del.onclick = async (ev) => {
+            ev.stopPropagation();
+            if (!confirm(`Delete ${e.dir ? 'the whole day ' : ''}${rel}?`)) return;
+            try {
+              const j = await (await fetch('/?action=delete&path=' + encodeURIComponent(rel), { cache: 'no-store' })).json();
+              if (j.error) alert(j.error); else loadRecs(dir);
+            } catch (err) { alert('delete failed'); }
+          };
+          li.appendChild(del);
+        }
+        recList.appendChild(li);
+      }
+      if (!items.length) recList.innerHTML = '<li>empty' + (dir ? '' : ' — is the SD card mounted?') + '</li>';
+    } catch (e) { recList.innerHTML = '<li class="off">cannot list (no SD card?)</li>'; }
+  }
+  // ---- in-page player for the MJPEG AVI recordings (browsers can't play AVI natively) ----
+  const player = document.getElementById('player');
+  let pl = { frames: [], i: 0, timer: null, fps: 2, url: null };
+  function parseAvi(buf) {
+    const dv = new DataView(buf), u8 = new Uint8Array(buf);
+    const tag = (o) => String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+    const frames = []; let fps = 2;
+    function walk(start, end) {
+      let o = start;
+      while (o + 8 <= end) {
+        const t = tag(o), len = dv.getUint32(o + 4, true);
+        if (t === 'LIST') { const lt = tag(o + 8); if (lt === 'hdrl' || lt === 'movi' || lt === 'strl') walk(o + 12, o + 8 + len); }
+        else if (t === 'avih') { const us = dv.getUint32(o + 8, true); if (us > 0) fps = 1e6 / us; }
+        else if (t === '00dc' && len > 0) frames.push([o + 8, len]);
+        o += 8 + len + (len & 1);
+      }
+    }
+    walk(12, buf.byteLength);
+    return { frames, fps };
+  }
+  async function playAvi(url, name) {
+    stopPlayer(); stop();                                   // pause the live stream while playing
+    player.hidden = false; document.getElementById('plName').textContent = name + ' — loading…';
+    try {
+      const buf = await (await fetch(url, { cache: 'force-cache' })).arrayBuffer();
+      const { frames, fps } = parseAvi(buf);
+      pl = { frames: frames.map(([o, l]) => new Blob([new Uint8Array(buf, o, l)], { type: 'image/jpeg' })), i: 0, timer: null, fps, url: null };
+      document.getElementById('plSeek').max = Math.max(0, pl.frames.length - 1);
+      document.getElementById('plName').textContent = `${name} — ${pl.frames.length} frames, ${(pl.frames.length / fps).toFixed(0)} s`;
+      showFrame(0); playPause(true);
+    } catch (e) { document.getElementById('plName').textContent = name + ' — cannot load'; }
+  }
+  function showFrame(i) {
+    if (!pl.frames.length) return;
+    pl.i = Math.max(0, Math.min(i, pl.frames.length - 1));
+    if (pl.url) URL.revokeObjectURL(pl.url);
+    pl.url = URL.createObjectURL(pl.frames[pl.i]);
+    img.src = pl.url;
+    document.getElementById('plSeek').value = pl.i;
+    document.getElementById('plTime').textContent = (pl.i / pl.fps).toFixed(1) + ' s';
+  }
+  function playPause(force) {
+    const playing = force !== undefined ? force : !pl.timer;
+    clearInterval(pl.timer); pl.timer = null;
+    if (playing) pl.timer = setInterval(() => { if (pl.i >= pl.frames.length - 1) { playPause(false); return; } showFrame(pl.i + 1); }, 1000 / pl.fps);
+    document.getElementById('plPlay').textContent = playing ? '❚❚' : '▶';
+  }
+  function stopPlayer() { clearInterval(pl.timer); pl = { frames: [], i: 0, timer: null, fps: 2, url: null }; player.hidden = true; }
+  document.getElementById('plPlay').onclick = () => playPause();
+  document.getElementById('plSeek').oninput = (e) => { playPause(false); showFrame(parseInt(e.target.value, 10)); };
+  document.getElementById('plClose').onclick = () => { stopPlayer(); start(); };
+
+  document.getElementById('recs').onclick = () => { recPanel.hidden = !recPanel.hidden; if (!recPanel.hidden) loadRecs(''); };
+  document.getElementById('recClose').onclick = () => { recPanel.hidden = true; };
+  document.getElementById('recRefresh').onclick = () => loadRecs(recDir);
+  document.getElementById('recUp').onclick = () => loadRecs(recDir.includes('/') ? recDir.slice(0, recDir.lastIndexOf('/')) : '');
+
+  start();
+  ctl('/status');
+  motionStatus();
+</script>
+</body>
+</html>

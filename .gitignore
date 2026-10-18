@@ -1,0 +1,3 @@
+# Local, machine/network-specific settings (camera address, Wi-Fi password) — never commit.
+config.local.json
+camera/wifi.conf

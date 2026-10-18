@@ -1,0 +1,4 @@
+{
+  "_comment": "Copy to config.local.json (git-ignored). The tools read the camera address from here; --camera on the command line overrides it.",
+  "camera": "192.168.1.100"
+}
