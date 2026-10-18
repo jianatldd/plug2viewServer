@@ -8,8 +8,7 @@
  * of two keeps RAM free on this 28 MB device. Static binary, no libraries.
  *
  *   /                        viewer page (static files from the www directory)
- *   /?action=h264            live stream: 12-byte header per frame + Annex-B access unit
- *                            (see live_hdr below); the page decodes it with WebCodecs
+ *   /?action=fmp4            live stream as fragmented MP4 (the page plays it via MSE)
  *   /?action=raw             live stream as plain Annex-B (VLC: vlc --demux h264 <url>)
  *   /?action=snapshot        one JPEG (grabbed from /dev/video0 on demand)
  *   /?action=save            snapshot -> <save_dir>/manual/<day>/<time>.jpg
@@ -660,7 +659,7 @@ static const struct hframe *ring_after(const struct hframe *f) {
     return NULL;
 }
 
-/* Live frame header: "H264" + u32 length + u8 flags(bit0 key) + 3 reserved = 12 bytes, then the Annex-B access unit. */
+/* Queue frame f for a live client: fMP4 fragment (page) or the bare Annex-B access unit (raw). */
 static void live_prepare(struct client *c, const struct hframe *f) {
     if (c->live_fmp4) {
         /* Build moof+mdat for f into c->buf and send it like a normal response body. The
@@ -677,8 +676,8 @@ static void live_prepare(struct client *c, const struct hframe *f) {
         return;
     }
     c->lf = f; c->live_seq = f->seq;
-    memcpy(c->live_hdr, "H264", 4); be32(c->live_hdr + 4, (unsigned)f->len); c->live_hdr[8] = f->key ? 1 : 0; c->live_hdr[9] = c->live_hdr[10] = c->live_hdr[11] = 0;
-    c->live_hdr_off = c->live_raw ? 12 : 0; c->off = 0; c->phase = P_LIVE_SEND;
+    c->live_hdr_off = 12;                        /* no per-frame header (the framed variant was removed) */
+    c->off = 0; c->phase = P_LIVE_SEND;
 }
 /* Pick the next frame for a live client: the frame after live_seq, or (if it fell behind
  * or is new) the newest keyframe. */
@@ -786,12 +785,9 @@ static void handle_request(struct client *c) {
         c->live = 1; c->live_fmp4 = 1; c->live_seq = 0; c->fmp4_seqno = 0; c->fmp4_t0 = 0;
         return;
     }
-    if (strstr(q, "action=h264") || strstr(q, "action=raw")) {
-        c->live = 1; c->live_raw = strstr(q, "action=raw") != NULL; c->live_seq = 0;
-        const char *h = c->live_raw
-            ? "HTTP/1.0 200 OK\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Type: video/h264\r\n\r\n"
-            : "HTTP/1.0 200 OK\r\nConnection: close\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: application/octet-stream\r\nX-Stream: h264-framed\r\n\r\n";
-        set_resp(c, h, NULL, 0);
+    if (strstr(q, "action=raw")) {               /* plain Annex-B H.264 for VLC / ffmpeg */
+        c->live = 1; c->live_raw = 1; c->live_seq = 0;
+        set_resp(c, "HTTP/1.0 200 OK\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Type: video/h264\r\n\r\n", NULL, 0);
         return;
     }
     if (strstr(q, "action=snapshot") || strstr(q, "action=save")) {
