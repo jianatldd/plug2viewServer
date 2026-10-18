@@ -129,7 +129,7 @@
 <footer><span id="status">connecting…</span><span id="ptz"></span><span id="info"></span></footer>
 <script>
   // Video comes from mjpg-streamer on this origin (?action=stream / ?action=snapshot).
-  // Pan/tilt, IR-cut and Wi-Fi calls go to /api/..., which mjpgd relays to `hkctl serve`
+  // Pan/tilt, IR-cut and Wi-Fi calls go to /api/..., which camd relays to `hkctl serve`
   // on the camera's localhost — same origin, same (optional) password, one port to forward.
   const CTL = '/api';
   const STEP = 120;  // steps per button press (~5 degrees of pan)

@@ -13,8 +13,8 @@ export TZ=${TZ:-EST5EDT,M3.2.0,M11.1.0}      # local time for file names (POSIX 
 
 stop() {
     rm -f /tmp/hk-watch/mjpg            # otherwise cron restarts us within a minute
-    killall camd mjpgd 2>/dev/null
-    killall mjpg_streamer 2>/dev/null   # pre-mjpgd installs
+    killall camd 2>/dev/null
+    killall mjpgd mjpg_streamer 2>/dev/null   # daemons of earlier versions (upgrade path)
     killall hkctl 2>/dev/null
     sleep 1
 }

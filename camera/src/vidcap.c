@@ -1,7 +1,7 @@
 /*
  * vidcap - dump N seconds of raw frames from a V4L2 device to a file, for probing the
  * Sonix module's second stream (/dev/video1, fourcc H264). Same old-kernel buffer layout
- * trick as mjpgd. Prints per-frame sizes so the frame rate and bitrate can be judged.
+ * trick as camd. Prints per-frame sizes so the frame rate and bitrate can be judged.
  *
  * Build: zig cc -target mipsel-linux-musleabi -mcpu=mips32 -Os -static -s -o vidcap vidcap.c
  * Usage: vidcap <dev> <fourcc> <WxH> <seconds> <outfile>     e.g. vidcap /dev/video1 H264 1280x720 5 /tmp/t.h264

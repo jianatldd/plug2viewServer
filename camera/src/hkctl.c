@@ -493,7 +493,7 @@ static int cmd_serve(int argc, char **argv) {
     signal(SIGCHLD, SIG_IGN);
     int s = socket(AF_INET, SOCK_STREAM, 0), one = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    /* Localhost only: clients reach this API through mjpgd's /api/ proxy on the video
+    /* Localhost only: clients reach this API through camd's /api/ proxy on the video
      * port, which carries the HTTP basic auth. `serve <port> all` binds every interface. */
     int all = argc > 3 && !strcmp(argv[3], "all");
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = all ? INADDR_ANY : htonl(0x7f000001) };
@@ -509,7 +509,7 @@ static int cmd_serve(int argc, char **argv) {
 /* ---- motion detection -----------------------------------------------------------
  * The Sonix module detects motion in hardware (9 zones). The vendor tool reads the
  * result through a UVC extension-unit control and prints "golllll <mask>"; polling it
- * once a second costs almost nothing and works while mjpgd is streaming.
+ * once a second costs almost nothing and works while camd is streaming.
  *
  *   hkctl motion <video-port>   daemon: poll; while motion (and 5 s after) save one frame
  *                               per second via http://127.0.0.1:<port>/?action=save&tag=motion
