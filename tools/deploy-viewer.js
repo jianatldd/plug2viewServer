@@ -31,7 +31,10 @@ setTimeout(() => {
     if (failed) throw new Error('TFTP server failed');
     const cmd = `cd /tmp && tftp -g -r viewer-deploy.sh -l plug2view-viewer-deploy.sh ${pc} && sh /tmp/plug2view-viewer-deploy.sh`;
     const r = spawnSync(process.execPath, [path.join(__dirname, 'camera-shell.js'), '--camera', camera, '--timeout', '30000', '-c', cmd], {encoding:'utf8', timeout:40000});
-    if (r.status || !r.stdout.includes('VIEWER_DEPLOY_OK')) throw new Error('Viewer deployment failed; previous page retained until verified transfer');
+    if (r.status || !r.stdout.includes('VIEWER_DEPLOY_OK')) {
+      process.stderr.write(r.stdout || ''); process.stderr.write(r.stderr || '');
+      throw new Error('Viewer deployment failed; previous page retained until verified transfer');
+    }
     console.log('Viewer installed and transfer checksum verified; previous page retained as index.html.previous.');
   } catch (e) {console.error(e.message); process.exitCode = 1;}
   finally {

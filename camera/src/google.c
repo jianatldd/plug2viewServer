@@ -20,10 +20,12 @@ static struct {
     int enabled;
     char project[128], origin[256], client[128], secret[128], user[128], password[128];
     char key[65], generation[65], statefile[512];
-    char rtc_token[65];
-    char rtc_request[260];
-    time_t rtc_exp, rtc_created;
-    int rtc_remote, rtc_viewer;
+    struct rtc_signal_session {
+        unsigned handle;
+        char token[65], request[260];
+        time_t exp;
+        int viewer;
+    } rtc[RTC_MAX_SESSIONS];
     char nonce[65], redirect[256], state[GOOGLE_STATE_MAX + 1], code[65];
     time_t flow_exp, code_exp, retry_at;
     unsigned failures;
@@ -73,7 +75,7 @@ static int rotate_generation(void) {
     if (fclose(f)) ok = 0;
     chmod(tmp, 0600);
     if (!ok || rename(tmp, g.statefile)) { remove(tmp); return 0; }
-    strcpy(g.generation, next); g.rtc_token[0] = 0; rtc_end(); return 1;
+    strcpy(g.generation, next); memset(g.rtc, 0, sizeof g.rtc); rtc_end_all(); return 1;
 }
 int google_init(const char *config) {
     memset(&g, 0, sizeof g); if (!config) return 0;
@@ -237,6 +239,36 @@ static int json_quote(const char *s, char *out, size_t cap) {
     out[n++] = '"'; out[n] = 0; return 1;
 }
 static void error(struct google_response *r, int code, const char *s) { fprintf(stderr, "google: response error status=%d reason=%s\n", code, s); r->code = code; snprintf(r->body, sizeof r->body, "{\"error\":\"%s\"}", s); }
+/* Signaling runs on camd's main thread; the media worker owns peer expiry. */
+static void rtc_reap(void) {
+    for(int i=0;i<RTC_MAX_SESSIONS;i++) {
+        struct rtc_signal_session *s=&g.rtc[i];
+        if(s->handle && (time(NULL)>=s->exp || !rtc_alive(s->handle))) {
+            rtc_end(s->handle); memset(s,0,sizeof *s);
+        }
+    }
+}
+static struct rtc_signal_session *rtc_token_session(const char *token,int viewer) {
+    rtc_reap();
+    for(int i=0;i<RTC_MAX_SESSIONS;i++)
+        if(g.rtc[i].handle && g.rtc[i].viewer==viewer && equal(token,g.rtc[i].token)) return &g.rtc[i];
+    return NULL;
+}
+static void rtc_release(struct rtc_signal_session *s) {
+    rtc_end(s->handle); memset(s,0,sizeof *s);
+}
+static struct rtc_signal_session *rtc_reserve(int viewer,const char *request) {
+    rtc_reap();
+    for(int i=0;i<RTC_MAX_SESSIONS;i++) if(!g.rtc[i].handle) {
+        struct rtc_signal_session *s=&g.rtc[i];
+        if(!random_hex(s->token)) return NULL;
+        s->handle=rtc_create(); if(!s->handle) { memset(s,0,sizeof *s); return NULL; }
+        s->viewer=viewer; s->exp=time(NULL)+3600;
+        if(request) strcpy(s->request,request);
+        return s;
+    }
+    return NULL;
+}
 void google_viewer_webrtc(const char *body, struct google_response *r) {
     memset(r, 0, sizeof *r); r->code = 200; r->type = "application/json";
     struct jp p = {.s = body};
@@ -245,24 +277,22 @@ void google_viewer_webrtc(const char *body, struct google_response *r) {
     int action = field(&p, 0, "action");
     if (jeq(&p, action, "end")) {
         char session[65];
-        if (!g.rtc_viewer || !*g.rtc_token || !jtext(&p, field(&p, 0, "session"), session, sizeof session) || !equal(session, g.rtc_token)) {
+        struct rtc_signal_session *s=NULL;
+        if (!jtext(&p, field(&p, 0, "session"), session, sizeof session) || !(s=rtc_token_session(session,1))) {
             error(r, 409, "session_replaced"); return;
         }
-        rtc_end(); g.rtc_token[0] = 0; g.rtc_viewer = 0;
+        rtc_release(s);
         strcpy(r->body, "{}"); return;
     }
     if (!jeq(&p, action, "offer")) { error(r, 400, "invalid_action"); return; }
     if (!rtc_ready()) { error(r, 503, "stream_unavailable"); return; }
-    char sdp[14001], answer[4096], quoted[8192], session[65];
+    char sdp[14001], answer[4096], quoted[8192];
     if (!jtext(&p, field(&p, 0, "sdp"), sdp, sizeof sdp)) { error(r, 400, "invalid_offer"); return; }
-    if (!random_hex(session)) { error(r, 503, "stream_unavailable"); return; }
-    /* Do not interrupt a Google Home viewer (or another browser). The page
-     * falls back to MP4 when the single WebRTC slot is occupied. */
-    if (!rtc_accept_offer(sdp, answer, sizeof answer)) { error(r, 409, "stream_busy_or_invalid_offer"); return; }
-    if (!json_quote(answer, quoted, sizeof quoted)) { rtc_end(); error(r, 500, "invalid_answer"); return; }
-    strcpy(g.rtc_token, session); g.rtc_viewer = g.rtc_remote = 1;
-    g.rtc_request[0] = 0; g.rtc_created = time(NULL); g.rtc_exp = g.rtc_created + 3600;
-    snprintf(r->body, sizeof r->body, "{\"sdp\":%s,\"session\":\"%s\"}", quoted, session);
+    struct rtc_signal_session *s=rtc_reserve(1,NULL);
+    if(!s) { if(rtc_full()) error(r,409,"stream_capacity_reached"); else error(r,503,"stream_unavailable"); return; }
+    if(!rtc_accept_offer(s->handle,sdp,answer,sizeof answer)) { rtc_release(s); error(r,400,"invalid_offer"); return; }
+    if(!json_quote(answer,quoted,sizeof quoted)) { rtc_release(s); error(r,500,"invalid_answer"); return; }
+    snprintf(r->body,sizeof r->body,"{\"sdp\":%s,\"session\":\"%s\"}",quoted,s->token);
 }
 static void rtc_signaling(const char *method, const char *body, const char *headers, struct google_response *r) {
     strcpy(r->extra, "Access-Control-Allow-Origin: https://www.gstatic.com\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nCache-Control: no-store\r\n");
@@ -272,21 +302,19 @@ static void rtc_signaling(const char *method, const char *body, const char *head
     if (value(&p, 0) < 0) { error(r, 400, "invalid_json"); return; } ws(&p);
     int action = field(&p, 0, "action");
     char auth[128];
-    int authorized = !g.rtc_viewer && *g.rtc_token && time(NULL) <= g.rtc_exp && google_header(headers, "Authorization", auth, sizeof auth) && !strncmp(auth, "Bearer ", 7) && equal(auth + 7, g.rtc_token);
-    fprintf(stderr,"google: signaling action=%s authorized=%d\n",jeq(&p,action,"answer")?"answer":jeq(&p,action,"end")?"end":jeq(&p,action,"offer")?"offer":"unknown",authorized);
+    struct rtc_signal_session *s=NULL;
+    int authorized = google_header(headers,"Authorization",auth,sizeof auth) && !strncmp(auth,"Bearer ",7) && (s=rtc_token_session(auth+7,0))!=NULL;
+    fprintf(stderr,"google: signaling action=%s authorized=%d session=%u at=%ld\n",jeq(&p,action,"answer")?"answer":jeq(&p,action,"end")?"end":jeq(&p,action,"offer")?"offer":"unknown",authorized,s?s->handle:0,(long)time(NULL));
     if (!authorized) { error(r, 401, "invalid_stream_token"); return; }
     if (body[p.pos] || !jeq(&p, field(&p, 0, "deviceId"), "plug2view")) { error(r, 400, "invalid_device"); return; }
-    if (jeq(&p, action, "end")) { rtc_end(); g.rtc_token[0] = 0; strcpy(r->body, "{}"); return; }
+    if (jeq(&p, action, "end")) { rtc_release(s); strcpy(r->body, "{}"); return; }
     char sdp[14001];
-    if (jeq(&p, action, "offer") && g.rtc_remote) {
+    if (jeq(&p, action, "offer")) {
         char answer[4096], quoted[8192];
-        if (!jtext(&p, field(&p, 0, "sdp"), sdp, sizeof sdp) || !rtc_accept_offer(sdp, answer, sizeof answer) || !json_quote(answer, quoted, sizeof quoted)) { error(r, 400, "invalid_offer"); return; }
+        if (!jtext(&p, field(&p, 0, "sdp"), sdp, sizeof sdp) || !rtc_accept_offer(s->handle,sdp, answer, sizeof answer) || !json_quote(answer, quoted, sizeof quoted)) { error(r, 400, "invalid_offer"); return; }
         snprintf(r->body, sizeof r->body, "{\"action\":\"answer\",\"sdp\":%s}", quoted); return;
     }
-    if (g.rtc_remote || !jeq(&p, action, "answer") || !jtext(&p, field(&p, 0, "sdp"), sdp, sizeof sdp) || !rtc_answer(sdp)) { error(r, 400, "invalid_answer"); return; }
-    /* Google supplied the answer to our offer: acknowledge it, do not return
-     * an answer action without an SDP (reserved for Google-originated offers). */
-    strcpy(r->body, "{}");
+    error(r, 400, "invalid_action");
 }
 static void fulfill_stream(const char *body, int online, struct google_response *r) {
     struct jp p = {.s = body};
@@ -315,27 +343,20 @@ static void fulfill_stream(const char *body, int online, struct google_response 
         const char *err = !online ? "deviceOffline" : !jeq(&p, field(&p, exe, "command"), "action.devices.commands.GetCameraStream") ? "functionNotSupported" : !hls && !webrtc ? "notSupported" : NULL;
         if (err) snprintf(r->body, sizeof r->body, "{\"requestId\":%s,\"payload\":{\"commands\":[{\"ids\":[\"plug2view\"],\"status\":\"ERROR\",\"errorCode\":\"%s\"}]}}", id, err);
         else if (webrtc) {
-            if (g.rtc_viewer) { rtc_end(); g.rtc_token[0] = 0; g.rtc_viewer = 0; }
-            /* Phone receivers may negotiate a different media layout. Omit
-             * cameraStreamOffer so Google initiates SDP negotiation. */
-            if (cast >= 0 && p.t[cast].type == 'f') {
-                time_t now = time(NULL);
-                if (!g.rtc_remote || !*g.rtc_token || now >= g.rtc_exp || (now - g.rtc_created >= 30 && strcmp(g.rtc_request, id))) {
-                    rtc_end(); g.rtc_token[0] = 0;
-                    if (!random_hex(g.rtc_token)) { error(r, 503, "stream_unavailable"); return; }
-                    g.rtc_created = now; g.rtc_exp = now + 3600;
-                }
-                g.rtc_remote = 1; strcpy(g.rtc_request, id);
-                snprintf(r->body, sizeof r->body, "{\"requestId\":%s,\"payload\":{\"commands\":[{\"ids\":[\"plug2view\"],\"status\":\"SUCCESS\",\"states\":{\"online\":true,\"cameraStreamProtocol\":\"webrtc\",\"cameraStreamSignalingUrl\":\"%s/google/webrtc\",\"cameraStreamAuthToken\":\"%s\"}}]}}", id, g.origin, g.rtc_token);
-                fprintf(stderr, "google: awaiting receiver offer\n"); return;
-            }
-            if (g.rtc_remote) { rtc_end(); g.rtc_token[0] = 0; g.rtc_remote = 0; }
-            char sdp[2048], quoted[4096];
-            int offer = rtc_offer(sdp, sizeof sdp, !strcmp(g.rtc_request,id));
-            if (!offer || !json_quote(sdp, quoted, sizeof quoted) || (offer == 1 && !random_hex(g.rtc_token)) || !*g.rtc_token) { g.rtc_token[0] = 0; rtc_end(); error(r, 503, "stream_unavailable"); return; }
-            if (offer == 1) g.rtc_exp = time(NULL) + 3600;
-            strcpy(g.rtc_request,id);
-            snprintf(r->body, sizeof r->body, "{\"requestId\":%s,\"payload\":{\"commands\":[{\"ids\":[\"plug2view\"],\"status\":\"SUCCESS\",\"states\":{\"online\":true,\"cameraStreamProtocol\":\"webrtc\",\"cameraStreamSignalingUrl\":\"%s/google/webrtc\",\"cameraStreamAuthToken\":\"%s\",\"cameraStreamOffer\":%s}}]}}", id, g.origin, g.rtc_token, quoted);
+            struct rtc_signal_session *s=NULL;
+            rtc_reap();
+            /* Only the same request ID is a retry. Different requests may be
+             * simultaneous viewers, even during the negotiation window. */
+            for(int i=0;i<RTC_MAX_SESSIONS;i++)
+                if(g.rtc[i].handle && !g.rtc[i].viewer && !strcmp(g.rtc[i].request,id)) { s=&g.rtc[i]; break; }
+            if(!s) s=rtc_reserve(0,id);
+            if(!s) { error(r,503,"stream_capacity_reached"); return; }
+            /* Omit cameraStreamOffer so every Google receiver proposes its
+             * supported media, including audio. Cast receivers cancelled our
+             * video-only camera offer before sending an answer or ICE checks. */
+            fprintf(stderr,"google: awaiting receiver offer session=%u\n",s->handle);
+            snprintf(r->body,sizeof r->body,"{\"requestId\":%s,\"payload\":{\"commands\":[{\"ids\":[\"plug2view\"],\"status\":\"SUCCESS\",\"states\":{\"online\":true,\"cameraStreamProtocol\":\"webrtc\",\"cameraStreamSignalingUrl\":\"%s/google/webrtc\",\"cameraStreamAuthToken\":\"%s\"}}]}}",id,g.origin,s->token);
+            return;
         } else {
             char access[192]; token('s', (unsigned long)time(NULL) + 3600, access);
             snprintf(r->body, sizeof r->body, "{\"requestId\":%s,\"payload\":{\"commands\":[{\"ids\":[\"plug2view\"],\"status\":\"SUCCESS\",\"states\":{\"online\":true,\"cameraStreamProtocol\":\"hls\",\"cameraStreamAccessUrl\":\"%s/hls/live.m3u8?token=%s\"}}]}}", id, g.origin, access);

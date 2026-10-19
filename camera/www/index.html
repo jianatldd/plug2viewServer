@@ -128,7 +128,7 @@
 </main>
 <footer><span id="status">connecting…</span><span id="ptz"></span><span id="info"></span></footer>
 <script>
-  // Live video uses WebRTC, with fragmented MP4 and snapshot fallbacks.
+  // Live video uses WebRTC; capacity exhaustion permits MP4/snapshot fallback.
   // Pan/tilt, IR-cut and Wi-Fi calls go to /api/..., which camd relays to `hkctl serve`
   // on the camera's localhost — same origin, same (optional) password, one port to forward.
   const CTL = '/api';
@@ -141,20 +141,27 @@
   const ptz = document.getElementById('ptz');
   let live = false, range = null;
 
-  // ---- live view: WebRTC first; MP4/MSE when unavailable or the RTC slot is busy.
+  // ---- live view: retry WebRTC; MP4/MSE only after explicit capacity exhaustion.
   const MS = window.MediaSource || window.ManagedMediaSource;
   const haveMse = !!MS;
   let mse = { abort: null, ms: null, sb: null, url: null, retry: null, lastData: 0, queue: [], frames: 0, t0: 0 };
   function showLive(el) { cv.hidden = el !== cv; img.hidden = el !== img; vid.hidden = el !== vid; }
 
-  let rtc = null;
+  let rtc = null, rtcRetry = null, rtcFailures = 0;
   async function viewerSignal(body, keepalive = false) {
-    const r = await fetch('/viewer/webrtc', { method: 'POST', cache: 'no-store',
-      credentials: 'same-origin', keepalive, signal: AbortSignal.timeout(15000),
-      headers: { 'Content-Type': 'application/json', 'X-Plug2View-Viewer': '1' },
-      body: JSON.stringify(body) });
-    if (!r.ok) throw new Error('WebRTC HTTP ' + r.status);
-    return r.json();
+    const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const r = await fetch('/viewer/webrtc', { method: 'POST', cache: 'no-store',
+        credentials: 'same-origin', keepalive, signal: controller.signal,
+        headers: { 'Content-Type': 'application/json', 'X-Plug2View-Viewer': '1' },
+        body: JSON.stringify(body) });
+      const data = await r.json();
+      if (!r.ok) {
+        const error = new Error('WebRTC HTTP ' + r.status);
+        error.status = r.status; error.code = data.error; throw error;
+      }
+      return data;
+    } finally { clearTimeout(timeout); }
   }
   function endSession(session) {
     if (session) return viewerSignal({ action: 'end', session }, true).catch(() => {});
@@ -162,10 +169,11 @@
   }
   let rtcEnding = Promise.resolve();
   function stopRtc() {
+    clearTimeout(rtcRetry); rtcRetry = null;
     const old = rtc; rtc = null;
     if (!old) return;
     clearInterval(old.timer);
-    old.pc.close();
+    if (old.pc) old.pc.close();
     if (vid.srcObject) { vid.srcObject.getTracks().forEach(t => t.stop()); vid.srcObject = null; }
     rtcEnding = endSession(old.session);
   }
@@ -175,32 +183,39 @@
     if (haveMse) { showLive(vid); startMse(); }
     else { showLive(img); startSnapshots(); }
   }
+  function retryRtc() {
+    if (!live) return;
+    stopRtc();
+    status.textContent = 'WebRTC reconnecting…'; status.className = 'off';
+    const delay = Math.min(10000, 2000 * ++rtcFailures);
+    rtcRetry = setTimeout(() => { rtcRetry = null; if (live) startRtc(); }, delay);
+  }
   async function startRtc() {
-    const current = rtc = { pc: new RTCPeerConnection({ iceServers: [] }), session: null,
+    const current = rtc = { pc: null, session: null,
       timer: null, frames: 0, t0: performance.now(), lastFrame: performance.now(), lastTime: -1 };
-    const pc = current.pc;
     const active = () => live && rtc === current;
-    const fallback = () => { if (active()) startFallback(); };
-    showLive(vid); vid.muted = true; vid.autoplay = true; vid.playsInline = true; vid.controls = false;
-    status.textContent = 'connecting…'; status.className = '';
-    pc.ontrack = e => {
-      if (!active() || e.track.kind !== 'video') return;
-      vid.srcObject = new MediaStream([e.track]); vid.play().catch(() => {});
-    };
-    pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') fallback(); };
-    current.timer = setInterval(() => {
-      if (!active()) return;
-      const now = performance.now();
-      // Also works on browsers without requestVideoFrameCallback.
-      if (!vid.paused && vid.readyState >= 2 && vid.currentTime !== current.lastTime) {
-        current.lastTime = vid.currentTime;
-        if (!vid.requestVideoFrameCallback) current.lastFrame = now;
-        status.textContent = 'live'; status.className = '';
-        info.textContent = vid.videoWidth + '×' + vid.videoHeight + ' H.264';
-      }
-      if (now - current.lastFrame > 12000) fallback();
-    }, 1000);
     try {
+      const pc = current.pc = new RTCPeerConnection({ iceServers: [] });
+      showLive(vid); vid.muted = true; vid.autoplay = true; vid.playsInline = true; vid.controls = false;
+      status.textContent = 'connecting…'; status.className = '';
+      pc.ontrack = e => {
+        if (!active() || e.track.kind !== 'video') return;
+        vid.srcObject = new MediaStream([e.track]); vid.play().catch(() => {});
+      };
+      pc.onconnectionstatechange = () => { if (active() && pc.connectionState === 'failed') retryRtc(); };
+      current.timer = setInterval(() => {
+        if (!active()) return;
+        const now = performance.now();
+        // Also works on browsers without requestVideoFrameCallback.
+        if (!vid.paused && vid.readyState >= 2 && vid.currentTime !== current.lastTime) {
+          current.lastTime = vid.currentTime;
+          if (!vid.requestVideoFrameCallback) current.lastFrame = now;
+          rtcFailures = 0;
+          status.textContent = 'live'; status.className = '';
+          info.textContent = vid.videoWidth + '×' + vid.videoHeight + ' H.264';
+        }
+        if (now - current.lastFrame > 12000) retryRtc();
+      }, 1000);
       await rtcEnding;
       if (!active()) return;
       pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -218,7 +233,11 @@
       if (!active()) { await endSession(answer.session); return; }
       current.session = answer.session;
       await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
-    } catch (e) { fallback(); }
+    } catch (e) {
+      if (!active()) return;
+      if (e.status === 409 && e.code === 'stream_capacity_reached') startFallback();
+      else retryRtc();
+    }
   }
 
   function startMse() {
@@ -309,8 +328,9 @@
     stopRtc(); stopMse(); stopSnapshots();
     live = true;
     document.getElementById('pause').textContent = 'Pause';
-    if (typeof RTCPeerConnection === 'function' && typeof AbortSignal.timeout === 'function') startRtc().catch(startFallback);
-    else startFallback();
+    rtcFailures = 0;
+    if (typeof RTCPeerConnection === 'function') startRtc();
+    else { showLive(vid); status.textContent = 'This browser does not support WebRTC'; status.className = 'off'; }
   }
   function stop() {
     live = false;

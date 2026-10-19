@@ -39,7 +39,8 @@ function startTransfer(req, rinfo) {
     if (msg.readUInt16BE(0) !== OP.ACK) return;
     const acked = msg.readUInt16BE(2);
     if (acked !== (block & 0xffff)) return;
-    const lastWasFinal = (block - 1) * BLOCK + BLOCK >= data.length;
+    // A full block is never terminal: exact multiples require an empty block.
+    const lastWasFinal = (block - 1) * BLOCK + BLOCK > data.length;
     if (lastWasFinal) {
       done = true; clearTimeout(timer); sock.close();
       console.log(`done ${name}`);

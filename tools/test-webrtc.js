@@ -1,7 +1,8 @@
 // Real Chrome -> camera ICE/DTLS/SRTP test. Does not link/unlink or revoke OAuth.
-// Starts one stream, replacing any active WebRTC test; closes it on completion.
+// Starts one independent stream and closes it on completion.
 // Use portable Node 22; Chrome debugging port 9223 and Playwright core are required.
 // --reload-tls sends SIGHUP during playback and verifies that the daemon survives.
+// Defaults to Cast fulfillment; --phone (legacy --receiver-offer) tests phone fulfillment.
 'use strict';
 const fs=require('fs'),path=require('path'),https=require('https'),crypto=require('crypto'),assert=require('assert/strict');
 const {spawnSync}=require('child_process');
@@ -10,8 +11,9 @@ const {chromium}=require(path.join(root,'.build/browser/node_modules/playwright-
 const cfg=require('./config').googleConfig();
 const origin=new URL(cfg.PUBLIC_ORIGIN);
 const badFingerprint=process.argv.includes('--bad-fingerprint');
-const receiverOffer=process.argv.includes('--receiver-offer');
+const phone=process.argv.includes('--phone')||process.argv.includes('--receiver-offer');
 const videoOnly=process.argv.includes('--video-only');
+const requestPrefix='webrtc-test-'+crypto.randomBytes(8).toString('hex');
 const sh=spawnSync(process.execPath,[path.join(__dirname,'camera-shell.js'),'--camera',camera,'-c','cat /mnt/sif/owrt/google.conf.state'],{encoding:'utf8',timeout:20000});
 if(sh.status) throw new Error('Cannot read camera token generation');
 const generation=(sh.stdout.match(/^([a-f0-9]{64})\r?$/m)||[])[1];
@@ -34,7 +36,7 @@ function request(url,body,token,method='POST') {
   });
 }
 async function offer(requestId='webrtc-browser-test') {
- const res=await request('/google/fulfillment',{requestId,inputs:[{intent:'action.devices.EXECUTE',payload:{commands:[{devices:[{id:'plug2view'}],execution:[{command:'action.devices.commands.GetCameraStream',params:{StreamToChromecast:!receiverOffer,SupportedStreamProtocols:receiverOffer?['webrtc']:['webrtc','hls']}}]}]}}]},access);
+ const res=await request('/google/fulfillment',{requestId:requestPrefix+'-'+requestId,inputs:[{intent:'action.devices.EXECUTE',payload:{commands:[{devices:[{id:'plug2view'}],execution:[{command:'action.devices.commands.GetCameraStream',params:{StreamToChromecast:!phone,SupportedStreamProtocols:['webrtc']}}]}]}}]},access);
  assert.equal(res.status,200);const cmd=res.json.payload.commands[0];assert.equal(cmd.status,'SUCCESS');
  assert.equal(cmd.states.cameraStreamProtocol,'webrtc');return cmd.states;
 }
@@ -44,8 +46,8 @@ async function offer(requestId='webrtc-browser-test') {
   const sync=await request('/google/fulfillment',{requestId:'webrtc-sync-test',inputs:[{intent:'action.devices.SYNC'}]},access);
   assert.deepEqual(sync.json.payload.devices[0].attributes.cameraStreamSupportedProtocols,['webrtc','hls']);
   const o=await offer();token=o.cameraStreamAuthToken;
-  assert.equal(typeof o.cameraStreamOffer,receiverOffer?'undefined':'string','Phone should initiate negotiation; Hub should receive camera offer');
-  const pending=await offer('webrtc-overlapping-test');
+  assert.equal(o.cameraStreamOffer,undefined,'Cast and phone receivers must initiate negotiation');
+  const pending=await offer();
   assert.ok(pending.cameraStreamAuthToken===token,'Overlapping fulfillment must preserve the pending token');
   assert.ok(pending.cameraStreamOffer===o.cameraStreamOffer,'Overlapping fulfillment must preserve the pending SDP');
   const unauthorized=await request('/google/webrtc',{action:'end',deviceId:'plug2view'},'wrong');
@@ -54,43 +56,39 @@ async function offer(requestId='webrtc-browser-test') {
   assert.equal((await request('/google/webrtc',{action:'end',deviceId:'wrong'},token)).status,400);
   assert.equal((await request('/google/webrtc',{action:'answer',deviceId:'plug2view',sdp:'invalid'},token)).status,400);
   const largeStarted=Date.now();
-  assert.equal((await request('/google/webrtc',{action:receiverOffer?'offer':'answer',deviceId:'plug2view',sdp:'x'.repeat(12000)},token)).status,400);
+  assert.equal((await request('/google/webrtc',{action:'offer',deviceId:'plug2view',sdp:'x'.repeat(12000)},token)).status,400);
   assert.ok(Date.now()-largeStarted<5000,'TLS must drain a POST body larger than the HTTP header buffer without waiting for another network event');
   const cors=await request('/google/webrtc',undefined,undefined,'OPTIONS');assert.equal(cors.status,200);assert.equal(cors.headers['access-control-allow-origin'],'https://www.gstatic.com');
   console.log('PASS: WebRTC preferred in SYNC; signaling rejects wrong token/device/SDP; CORS preflight works');
   browser=await chromium.connectOverCDP('http://127.0.0.1:9223');context=await browser.newContext();const page=await context.newPage();
   await page.setContent('<video id="v" autoplay muted playsinline style="width:640px"></video>');
-  let description=await page.evaluate(async ({sdp,receiverOffer,videoOnly})=>{
+  let description=await page.evaluate(async ({videoOnly})=>{
    const pc=window.pc=new RTCPeerConnection({iceServers:[]});window.samples=[];
    const video=document.querySelector('video');
    const stream=new MediaStream();video.srcObject=stream;
    pc.ontrack=e=>{stream.addTrack(e.track);video.play().catch(()=>{});};
    const frame=(now,m)=>{if(window.samples.length<300) window.samples.push({captureToCallbackMs:m.captureTime===undefined?null:now-m.captureTime,decodeMs:m.processingDuration===undefined?null:m.processingDuration*1000});video.requestVideoFrameCallback(frame);};video.requestVideoFrameCallback(frame);
-   if(receiverOffer) {
-    const audio=pc.addTransceiver('audio',{direction:'recvonly'});
-    if(videoOnly)audio.setCodecPreferences(RTCRtpReceiver.getCapabilities('audio').codecs.filter(c=>c.mimeType.toLowerCase()==='audio/opus'));
-    pc.addTransceiver('video',{direction:'recvonly'});
-    pc.createDataChannel('diagnostics');
-    await pc.setLocalDescription(await pc.createOffer());
-   } else { await pc.setRemoteDescription({type:'offer',sdp});await pc.setLocalDescription(await pc.createAnswer()); }
+   const audio=pc.addTransceiver('audio',{direction:'recvonly'});
+   if(videoOnly)audio.setCodecPreferences(RTCRtpReceiver.getCapabilities('audio').codecs.filter(c=>c.mimeType.toLowerCase()==='audio/opus'));
+   pc.addTransceiver('video',{direction:'recvonly'});
+   pc.createDataChannel('diagnostics');
+   await pc.setLocalDescription(await pc.createOffer());
    if(pc.iceGatheringState!=='complete') await new Promise(resolve=>{const t=setTimeout(resolve,4000);pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete'){clearTimeout(t);resolve();}});});
    return pc.localDescription.sdp;
-  },{sdp:o.cameraStreamOffer,receiverOffer,videoOnly});
-  const action=receiverOffer?'offer':'answer';
+  },{videoOnly});
+  const action='offer';
   if(badFingerprint) description=description.replace(/(a=fingerprint:sha-256 )([0-9A-F]{2})/ig,(_,prefix,byte)=>prefix+(byte==='00'?'01':'00'));
   const a=await request('/google/webrtc',{action,deviceId:'plug2view',sdp:description},token);
   assert.equal(a.status,200,'Camera must accept browser '+action);
   assert.equal(a.headers['www-authenticate'],undefined,'Authorized Google signaling must not require viewer credentials');
-  if(receiverOffer) {
-   assert.equal(a.json.action,'answer');
-   assert.ok((videoOnly?/^m=audio 0 /m:/^m=audio 9 UDP\/TLS\/RTP\/SAVPF 0\r?$/m).test(a.json.sdp) && /^m=application 0 /m.test(a.json.sdp),'Negotiate PCMU if offered, reject unsupported audio and data');
-   assert.equal((a.json.sdp.match(/^m=/gm)||[]).length,3,'Answer must preserve offered media count');
-   await page.evaluate(sdp=>pc.setRemoteDescription({type:'answer',sdp}),a.json.sdp);
-   console.log('PASS: receiver offer negotiates '+(videoOnly?'video only':'H264 plus silent PCMU')+'; data channel rejected');
-  } else assert.deepEqual(a.json,{},'A camera-originated offer must acknowledge Google answer with an empty object');
+  assert.equal(a.json.action,'answer');
+  assert.ok((videoOnly?/^m=audio 0 /m:/^m=audio 9 UDP\/TLS\/RTP\/SAVPF 0\r?$/m).test(a.json.sdp) && /^m=application 0 /m.test(a.json.sdp),'Negotiate PCMU if offered, reject unsupported audio and data');
+  assert.equal((a.json.sdp.match(/^m=/gm)||[]).length,3,'Answer must preserve offered media count');
+  await page.evaluate(sdp=>pc.setRemoteDescription({type:'answer',sdp}),a.json.sdp);
+  console.log('PASS: '+(phone?'phone':'Cast')+' receiver offer negotiates '+(videoOnly?'video only':'H264 plus silent PCMU')+'; data channel rejected');
   if(!badFingerprint) {
    await new Promise(resolve=>setTimeout(resolve,1000));
-   const repeated=await offer('webrtc-after-answer-test');
+   const repeated=await offer();
    assert.ok(repeated.cameraStreamAuthToken===token,'Fulfillment after answer must preserve the stream token');
    assert.ok(repeated.cameraStreamOffer===o.cameraStreamOffer,'Fulfillment after answer must preserve the SDP');
    const ack=await request('/google/webrtc',{action,deviceId:'plug2view',sdp:description},token);
@@ -122,18 +120,18 @@ async function offer(requestId='webrtc-browser-test') {
    console.log('PASS: mismatched SDP certificate fingerprint cannot establish DTLS or receive video');return;
   }
   assert.equal(latest.connection,'connected');assert.ok(latest.frames-first.frames>100,'Must keep decoding moving video');
-  if(receiverOffer&&!videoOnly) {
+  if(!videoOnly) {
    assert.equal(latest.audioCodec,'audio/PCMU');assert.ok(latest.audioSamples-first.audioSamples>150000,'Must continuously decode silent audio');
    assert.equal(latest.audioEnergy,0,'Generated audio must remain silent');assert.equal(latest.audioLost,0);
   } else assert.equal(latest.audioPackets,0);
-  const established=await offer('webrtc-after-answer-test');
+  const established=await offer();
   assert.ok(established.cameraStreamAuthToken===token && established.cameraStreamOffer===o.cameraStreamOffer,'Exact request retry after setup window must preserve the established session');
   const measurements=await page.evaluate(()=>window.samples.filter(x=>x.captureToCallbackMs!==null).map(x=>x.captureToCallbackMs));
   if(measurements.length) {measurements.sort((a,b)=>a-b);console.log('Browser estimated capture-to-render ms: median='+Math.round(measurements[Math.floor(measurements.length/2)])+', p95='+Math.round(measurements[Math.floor(measurements.length*.95)]));}
   console.log('PASS: Chrome received and continuously decoded camera H264 over authenticated DTLS/SRTP');
   assert.equal((await request('/google/webrtc',{action:'end',deviceId:'plug2view'},token)).status,200);
   const next=await offer('webrtc-new-session-test'),oldToken=token;token=next.cameraStreamAuthToken;
-  assert.ok(token!==oldToken && (receiverOffer || next.cameraStreamOffer!==o.cameraStreamOffer),'Explicit end must allow fresh session credentials');
+  assert.ok(token!==oldToken,'Explicit end must allow fresh session credentials');
   assert.equal((await request('/google/webrtc',{action:'end',deviceId:'plug2view'},oldToken)).status,401,'Retired token must not end the new session');
   console.log('PASS: explicit end allows a new session; retired token cannot control it');
  } finally {

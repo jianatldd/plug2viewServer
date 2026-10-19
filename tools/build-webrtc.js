@@ -27,7 +27,9 @@ const features = 'ARPA_INET_H BYTESWAP_H INTTYPES_H NETINET_IN_H STDINT_H STDLIB
 fs.writeFileSync(path.join(cfg, 'config.h'), '#define CPU_RISC 1\n#define SIZEOF_UNSIGNED_LONG 4\n#define SIZEOF_UNSIGNED_LONG_LONG 8\n#define PACKAGE_VERSION "2.8.1"\n#define PACKAGE_STRING "libsrtp2 2.8.1"\n' + features.map(x => `#define HAVE_${x} 1\n`).join(''));
 const common = ['-target','mipsel-linux-musleabi','-mcpu=mips32','-Os','-ffunction-sections','-fdata-sections'];
 const mbFlags = ['-Icamera/src', '-I.build/webrtc/mbedtls/include', '-DMBEDTLS_CONFIG_FILE="webrtc-mbedtls.h"'];
-const srFlags = ['-I.build/webrtc/config','-I.build/webrtc/libsrtp/include','-I.build/webrtc/libsrtp/crypto/include','-DHAVE_CONFIG_H'];
+// SRTP encrypts/authenticates every packet for every peer. Optimize this hot
+// path for speed; keep the larger DTLS dependency optimized for binary size.
+const srFlags = ['-O2','-I.build/webrtc/config','-I.build/webrtc/libsrtp/include','-I.build/webrtc/libsrtp/crypto/include','-DHAVE_CONFIG_H'];
 const srFiles = ['srtp/srtp.c','crypto/cipher/cipher.c','crypto/cipher/cipher_test_cases.c','crypto/cipher/null_cipher.c','crypto/cipher/aes.c','crypto/cipher/aes_icm.c','crypto/hash/auth.c','crypto/hash/auth_test_cases.c','crypto/hash/null_auth.c','crypto/hash/hmac.c','crypto/hash/sha1.c','crypto/kernel/alloc.c','crypto/kernel/crypto_kernel.c','crypto/kernel/err.c','crypto/kernel/key.c','crypto/math/datatypes.c','crypto/replay/rdb.c','crypto/replay/rdbx.c'];
 const jobs = fs.readdirSync(path.join(dir,'mbedtls/library')).filter(f=>f.endsWith('.c')).map(f=>['.build/webrtc/mbedtls/library/'+f,mbFlags]);
 jobs.push(...srFiles.map(f=>['.build/webrtc/libsrtp/'+f,srFlags]));
