@@ -12,6 +12,7 @@ struct tlsconn *tls_accept(int fd);                                   /* new ser
 void tls_free(struct tlsconn *t);
 int  tls_pump(struct tlsconn *t, int can_read, int can_write);        /* -1 when finished */
 int  tls_want_events(struct tlsconn *t);                              /* POLLIN/POLLOUT the engine needs */
+int  tls_has_input(struct tlsconn *t);                                /* decrypted bytes already buffered */
 int  tls_recv(struct tlsconn *t, void *buf, size_t n);                /* plaintext in, 0 = none yet */
 int  tls_send(struct tlsconn *t, const void *buf, size_t n);          /* plaintext out, bytes accepted */
 int  tls_closed(struct tlsconn *t);

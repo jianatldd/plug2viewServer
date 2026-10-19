@@ -10,10 +10,12 @@ const path = require('path');
 
 const root = path.resolve(process.argv[2] || '.');
 const port = Number(process.argv[3] || 69);
+const allowedClient = process.argv[4];
 const BLOCK = 512;
 const OP = { RRQ: 1, DATA: 3, ACK: 4, ERROR: 5 };
 
 function startTransfer(req, rinfo) {
+  if (allowedClient && rinfo.address !== allowedClient) return;
   const name = req.toString('latin1', 2, req.indexOf(0, 2));
   const file = path.join(root, path.basename(name)); // no directory traversal
   let data;

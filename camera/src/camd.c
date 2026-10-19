@@ -38,11 +38,19 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/file.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <linux/videodev2.h>
 #include "tls.h"
+#include "google.h"
+#include "camera-presets.h"
+#include "webrtc.h"
+#include "recording-policy.h"
+
+static volatile sig_atomic_t reload_tls;
+static void reload_tls_signal(int sig) { (void)sig;reload_tls=1; }
 
 /* ---- old-kernel V4L2 buffer layout (musl has 64-bit time_t; the 2.6.21 driver wants
  * the classic 68-byte struct; the ioctl number encodes the size) --------------------- */
@@ -80,6 +88,7 @@ static size_t ring_bytes = 0;
 static unsigned frame_seq = 0;
 static time_t last_frame_time = 0;
 static unsigned stat_frames = 0; static unsigned long long stat_bytes = 0; static long long stat_t0 = 0;
+static void hls_tick(void);
 static double stat_fps = 0, stat_mbps = 0;
 
 static struct hframe *ring_at(unsigned i) { return &ring[(ring_head + RING_MAX - ring_count + i) % RING_MAX]; } /* i = 0 oldest */
@@ -105,6 +114,7 @@ static void ring_push(const unsigned char *d, size_t n, long long ts) {
     if (!f->data) return;
     memcpy(f->data, d, n); f->len = n; f->key = au_is_key(d, n); f->ts = ts; f->seq = ++frame_seq;
     ring_head = (ring_head + 1) % RING_MAX; ring_count++; ring_bytes += n;
+    rtc_frame(d, n, ts, f->key);
 }
 
 /* ---- V4L2 capture (H.264 from video1) ------------------------------------------- */
@@ -295,6 +305,8 @@ static void list_dir(const char *rel, char *out, int n) {
  * stripped and kept for avcC); the moov with the sample tables is written at stop. */
 #define REC_MAX_SAMPLES (REC_MAX_SECONDS * 30)
 static int rec_fd = -1;
+static int rec_manual;
+static long long rec_manual_until;
 static unsigned rec_nsamples = 0, rec_nkeys = 0;
 static unsigned *rec_size = NULL, *rec_dur = NULL, *rec_keys = NULL;
 static unsigned long long *rec_off = NULL;
@@ -365,6 +377,8 @@ static void rec_write_moov(void) {
 }
 
 static void rec_stop(void) {
+    rec_manual=0;
+    rec_manual_until=0;
     if (rec_fd < 0) return;
     rec_active = 0;
     unsigned long long end = lseek(rec_fd, 0, SEEK_CUR);
@@ -378,7 +392,13 @@ static void rec_stop(void) {
 }
 
 /* Write one access unit as an MP4 sample (AVCC), harvesting SPS/PPS. */
+static void rec_expire(void) {
+    if(rec_fd>=0 && rec_manual && recording_clock_ms()>=rec_manual_until) {
+        fprintf(stderr,"manual recording reached five-minute limit\n"); rec_stop();
+    }
+}
 static void rec_frame(const struct hframe *f) {
+    rec_expire();
     if (rec_fd < 0) return;
     if (rec_waiting_key) { if (!f->key) return; rec_waiting_key = 0; }
     if (rec_nsamples >= REC_MAX_SAMPLES) { rec_stop(); return; }
@@ -407,6 +427,12 @@ static void rec_frame(const struct hframe *f) {
 
 static int rec_start(const char *tag, int with_pre, char *out, int n) {
     if (!save_dir) return -1;
+    rec_expire();
+    if(!strcmp(tag,"motion") && motion_suppressed()) return -4;
+    if(rec_fd>=0) {
+        if(!strcmp(tag,"manual") && !rec_manual) { rec_manual=1; rec_manual_until=recording_clock_ms()+MANUAL_RECORD_MS; }
+        snprintf(out,n,"%s",rec_name); return 0;
+    }
     rec_stop();
     if (ensure_space() < 0) return -2;
     /* pre-roll: start at the newest keyframe that is at least PRE_SECONDS old (or the oldest key) */
@@ -420,14 +446,18 @@ static int rec_start(const char *tag, int with_pre, char *out, int n) {
     rec_fd = open_recfile(tag, "mp4", t0, rec_name, sizeof rec_name);
     if (rec_fd < 0) return -3;
     rec_size = calloc(REC_MAX_SAMPLES, 4); rec_dur = calloc(REC_MAX_SAMPLES, 4); rec_keys = calloc(REC_MAX_SAMPLES, 4); rec_off = calloc(REC_MAX_SAMPLES, 8);
-    if (!rec_size || !rec_dur || !rec_keys || !rec_off) { close(rec_fd); rec_fd = -1; return -3; }
+    if (!rec_size || !rec_dur || !rec_keys || !rec_off) {
+        close(rec_fd); rec_fd = -1; free(rec_size); free(rec_dur); free(rec_keys); free(rec_off);
+        rec_size=rec_dur=rec_keys=NULL; rec_off=NULL; return -3;
+    }
     rec_nsamples = rec_nkeys = 0; rec_sps_len = rec_pps_len = 0; rec_last_ts = 0;
     static const unsigned char ftyp[] = { 0,0,0,0x20, 'f','t','y','p', 'i','s','o','m', 0,0,2,0, 'i','s','o','m', 'i','s','o','2', 'a','v','c','1', 'm','p','4','1' };
     wr(rec_fd, ftyp, sizeof ftyp);
     rec_mdat_pos = sizeof ftyp;
     static const unsigned char mdat[] = { 0,0,0,0, 'm','d','a','t' };
     wr(rec_fd, mdat, 8);
-    rec_waiting_key = 1; rec_active = 1; rec_last_write = time(NULL);
+    rec_waiting_key = 1; rec_active = 1; rec_manual=!strcmp(tag,"manual"); rec_last_write = time(NULL);
+    if(rec_manual) rec_manual_until=recording_clock_ms()+MANUAL_RECORD_MS;
     for (unsigned i = first; i < ring_count; i++) rec_frame(ring_at(i));
     snprintf(out, n, "%s", rec_name);
     return 0;
@@ -471,7 +501,7 @@ static size_t au_to_avcc(const unsigned char *d, size_t n, unsigned char *out, s
 }
 
 static void fmp4_init_segment(struct bb *b, const unsigned char *sps, int spsl, const unsigned char *pps, int ppsl) {
-    static const unsigned char ftyp[] = { 0,0,0,0x1c, 'f','t','y','p', 'i','s','o','m', 0,0,2,0, 'i','s','o','m', 'i','s','o','5', 'a','v','c','1' };
+    static const unsigned char ftyp[] = { 0,0,0,0x1c, 'f','t','y','p', 'i','s','o','m', 0,0,2,0, 'i','s','o','m', 'i','s','o','6', 'a','v','c','1' };
     bb_put(b, ftyp, sizeof ftyp);
     unsigned timescale = 1000000;
     size_t moov = box_begin(b, "moov");
@@ -524,12 +554,14 @@ static void fmp4_fragment(struct bb *b, unsigned seqno, unsigned long long dts, 
 }
 
 /* ---- HTTP ----------------------------------------------------------------------- */
-enum phase { P_REQ, P_SEND, P_LIVE_WAIT, P_LIVE_SEND, P_CLOSING };
+enum phase { P_REQ, P_SEND, P_LIVE_WAIT, P_LIVE_SEND, P_CLOSING, P_HLS_WAIT };
 struct client {
     int fd, local;
+    time_t activity;
+    char hls_token[192];
     struct tlsconn *tls;                     /* non-NULL for HTTPS clients */
     enum phase phase;
-    char req[2048]; int reqlen;
+    char req[8192]; int reqlen; /* OAuth state plus mobile browser headers. */
     unsigned char *body; size_t body_len, body_want;   /* POST body (browser-made JPEG for /?action=save) */
     unsigned char *buf; size_t len, off;     /* current response / live chunk being sent */
     int live, live_raw, live_fmp4;           /* live stream client; raw = plain Annex-B; fmp4 = MSE */
@@ -554,16 +586,16 @@ static void cli_close(struct client *c) {
 /* Socket I/O through TLS when the client is HTTPS. Returns bytes, 0 = would block /
  * nothing yet, -1 = closed or error. */
 static int cli_recv(struct client *c, void *buf, size_t n) {
-    if (c->tls) return tls_closed(c->tls) ? -1 : tls_recv(c->tls, buf, n);
+    if (c->tls) { int r = tls_closed(c->tls) ? -1 : tls_recv(c->tls, buf, n); if (r > 0) c->activity = time(NULL); return r; }
     ssize_t r = read(c->fd, buf, n);
-    if (r > 0) return (int)r;
+    if (r > 0) { c->activity = time(NULL); return (int)r; }
     if (r == 0) return -1;
     return (errno == EAGAIN || errno == EINTR) ? 0 : -1;
 }
 static int cli_send(struct client *c, const void *p, size_t n) {
-    if (c->tls) return tls_closed(c->tls) ? -1 : tls_send(c->tls, p, n);
+    if (c->tls) { int r = tls_closed(c->tls) ? -1 : tls_send(c->tls, p, n); if (r > 0) c->activity = time(NULL); return r; }
     ssize_t w = write(c->fd, p, n);
-    if (w >= 0) return (int)w;
+    if (w >= 0) { c->activity = time(NULL); return (int)w; }
     return (errno == EAGAIN || errno == EINTR) ? 0 : -1;
 }
 
@@ -582,8 +614,9 @@ static void set_resp(struct client *c, const char *hdr, const unsigned char *bod
     c->len = hl + len; c->off = 0; c->phase = P_SEND;
 }
 static void send_simple(struct client *c, int code, const char *ctype, const char *body, const char *extra) {
-    char h[400]; snprintf(h, sizeof h, "HTTP/1.0 %d %s\r\nContent-Type: %s\r\nConnection: close\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n%sContent-Length: %d\r\n\r\n",
-                          code, code == 200 ? "OK" : code == 401 ? "Unauthorized" : code == 404 ? "Not Found" : "Error", ctype, extra ? extra : "", (int)strlen(body));
+    char h[GOOGLE_RESPONSE_EXTRA + 512]; snprintf(h, sizeof h, "HTTP/1.0 %d %s\r\nContent-Type: %s\r\nConnection: close\r\nCache-Control: no-store\r\n%s%sContent-Length: %d\r\n\r\n",
+                          code, code == 200 ? "OK" : code == 401 ? "Unauthorized" : code == 404 ? "Not Found" : "Error", ctype,
+                          extra && strstr(extra, "Access-Control-Allow-Origin:") ? "" : "Access-Control-Allow-Origin: *\r\n", extra ? extra : "", (int)strlen(body));
     set_resp(c, h, (const unsigned char *)body, strlen(body));
 }
 static void send_json(struct client *c, int code, const char *body) { send_simple(c, code, "application/json", body, NULL); }
@@ -593,6 +626,7 @@ static const char *ctype_of(const char *p) {
     if (!strcmp(e, ".html")) return "text/html; charset=utf-8";
     if (!strcmp(e, ".jpg") || !strcmp(e, ".jpeg")) return "image/jpeg";
     if (!strcmp(e, ".mp4")) return "video/mp4";
+    if (!strcmp(e, ".m4s")) return "video/iso.segment";
     if (!strcmp(e, ".avi")) return "video/x-msvideo";
     if (!strcmp(e, ".h264")) return "video/h264";
     if (!strcmp(e, ".png")) return "image/png";
@@ -611,7 +645,7 @@ static void send_file_forked(struct client *c, const char *full) {
     lseek(fd, 0, SEEK_SET);
     if (fork() == 0) {
         alarm(900); fcntl(c->fd, F_SETFL, 0);
-        char h[256]; int hl = snprintf(h, sizeof h, "HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Type: %s\r\nContent-Length: %ld\r\nCache-Control: max-age=86400\r\n\r\n", ctype_of(full), (long)len);
+        char h[300]; int hl = snprintf(h, sizeof h, "HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Type: %s\r\nContent-Length: %ld\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n\r\n", ctype_of(full), (long)len);
         struct tlsio *tio = c->tls ? tls_blocking(c->tls) : NULL;
         if (tio) tls_blocking_write(tio, h, hl); else wr(c->fd, h, hl);
         static unsigned char buf[16384]; ssize_t r;
@@ -748,20 +782,52 @@ static void cli_after_write(struct client *c, int r) {
     else if (c->tls && tls_pump(c->tls, 0, 1) < 0) cli_close(c);
 }
 
+#include "hls.inc"
+
+#include "google-controls.inc"
 static void handle_request(struct client *c) {
-    char raw[sizeof c->req]; memcpy(raw, c->req, c->reqlen); int rawlen = c->reqlen;
+    char raw[sizeof c->req]; memcpy(raw, c->req, c->reqlen); raw[c->reqlen] = 0; int rawlen = c->reqlen;
     char *line_end = strstr(c->req, "\r\n"); if (line_end) *line_end = 0;
-    int is_get = !strncmp(c->req, "GET ", 4), is_post = !strncmp(c->req, "POST ", 5);
+    int is_get = !strncmp(c->req, "GET ", 4), is_post = !strncmp(c->req, "POST ", 5), is_options = !strncmp(c->req, "OPTIONS ", 8);
     char *path = strchr(c->req, ' ');
-    if (!path || (!is_get && !is_post)) { send_simple(c, 400, "text/plain", "Bad Request", NULL); return; }
+    if (!path || (!is_get && !is_post && !is_options)) { send_simple(c, 400, "text/plain", "Bad Request", NULL); return; }
     path++; char *sp = strchr(path, ' '); if (sp) *sp = 0;
-    if (auth[0] && !c->local) {
-        const char *a = line_end ? strstr(line_end + 1, "Authorization: ") : NULL;
-        if (!a || strncmp(a + 15, auth, strlen(auth))) { send_simple(c, 401, "text/plain", "Unauthorized", "WWW-Authenticate: Basic realm=\"camera\"\r\n"); return; }
+    char *query = strchr(path, '?'); query = query ? query + 1 : "";
+    if (!strncmp(path, "/google/", 8)) {
+        if (c->body && memchr(c->body, 0, c->body_len)) { send_json(c, 400, "{\"error\":\"invalid_body\"}"); return; }
+        if (*query) query[-1] = 0;
+        struct google_response r;
+        google_handle(is_options ? "OPTIONS" : is_post ? "POST" : "GET", path, query, c->body ? (char *)c->body : "", raw,
+                      c->tls != NULL || c->local, last_frame_time && time(NULL) - last_frame_time < 10, &r);
+        /* Warm the HLS stream as soon as Google asks for it, before the player fetches. */
+        if (r.code == 200 && strstr(r.body, "cameraStreamAccessUrl")) hls_start();
+        send_simple(c, r.code, r.type, r.body, r.extra); return;
+    }
+    if (is_options) { send_simple(c, 405, "text/plain", "Method not allowed", NULL); return; }
+    char stream_token[192]; int signed_hls = is_get && !strncmp(path, "/hls/", 5) &&
+        (c->tls || c->local) && google_stream_token(query, stream_token, sizeof stream_token);
+    if (auth[0] && !c->local && !signed_hls) {
+        char supplied[256];
+        if (!google_header(raw, "Authorization", supplied, sizeof supplied) || strcmp(supplied, auth)) { send_simple(c, 401, "text/plain", "Unauthorized", "WWW-Authenticate: Basic realm=\"camera\"\r\n"); return; }
+    }
+    if (!strcmp(path, "/viewer/webrtc")) {
+        /* A non-simple header prevents cross-origin forms from starting or
+         * stopping a stream using the browser's cached Basic credentials.
+         * OPTIONS is rejected above; this endpoint has no CORS permission. */
+        char viewer[16];
+        if (!is_post) { send_json(c, 405, "{\"error\":\"method_not_allowed\"}"); return; }
+        if (!google_header(raw, "X-Plug2View-Viewer", viewer, sizeof viewer) || strcmp(viewer, "1")) { send_json(c, 403, "{\"error\":\"viewer_header_required\"}"); return; }
+        if (!c->body || c->body_len > 16000 || memchr(c->body, 0, c->body_len)) { send_json(c, 400, "{\"error\":\"invalid_body\"}"); return; }
+        struct google_response r;
+        google_viewer_webrtc((char *)c->body, &r);
+        char h[256];
+        snprintf(h, sizeof h, "HTTP/1.0 %d Result\r\nContent-Type: application/json\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Length: %zu\r\n\r\n", r.code, strlen(r.body));
+        set_resp(c, h, (const unsigned char *)r.body, strlen(r.body)); return;
     }
     if (!strncmp(path, "/api/", 5)) { proxy_api(c, raw, rawlen, is_post ? "POST" : "GET", path + 4); return; }
     char *q = strchr(path, '?'); if (q) *q++ = 0; else q = "";
-    char body[600];
+    char body[1536];
+    if (is_get && !strncmp(path, "/hls/", 5)) { hls_request(c, path, signed_hls ? stream_token : ""); return; }
     if (is_post) {
         /* POST /?action=save with a JPEG body: the page renders the decoded H.264 frame to a
          * canvas and uploads it, so no second V4L2 stream is needed for snapshots. */
@@ -810,8 +876,10 @@ static void handle_request(struct client *c) {
         if (strstr(q, "start=1")) {
             char rel[256]; const char *tag = strstr(q, "tag=manual") ? "manual" : "motion";
             r = rec_start(tag, strstr(q, "pre=1") != NULL, rel, sizeof rel);
+            if(r==-4) { send_json(c,409,"{\"error\":\"motion_suppressed\"}"); return; }
             snprintf(body, sizeof body, r == 0 ? "{\"recording\":\"%s\"}" : "{\"error\":\"cannot start recording (%s)\"}", r == 0 ? rel : r == -2 ? "no SD card" : "write failed");
         } else if (strstr(q, "stop=1")) {
+            if(strstr(q,"tag=motion") && rec_manual) { send_json(c,200,"{\"manual_recording\":true}"); return; }
             unsigned ns = rec_nsamples; char nm[256]; snprintf(nm, sizeof nm, "%s", rec_fd >= 0 ? rec_name : "");
             rec_stop(); snprintf(body, sizeof body, "{\"closed\":\"%s\",\"samples\":%u}", nm, ns);
         } else if (strstr(q, "frame=1")) {           /* compatibility with older hkctl: frames are appended automatically */
@@ -821,9 +889,11 @@ static void handle_request(struct client *c) {
         return;
     }
     if (strstr(q, "action=status")) {
+        rec_expire();
         struct hframe *nf = ring_newest();
-        snprintf(body, sizeof body, "{\"fps\":%.1f,\"mbps\":%.2f,\"viewers\":%d,\"recording\":%s,\"rec_samples\":%u,\"ring_frames\":%u,\"ring_kb\":%zu,\"frame_age_ms\":%lld}",
-                 stat_fps, stat_mbps, live_viewers(), rec_fd >= 0 ? "true" : "false", rec_nsamples, ring_count, ring_bytes / 1024, nf ? (now_us() - nf->ts) / 1000 : -1LL);
+        char rtc[600]; rtc_status(rtc, sizeof rtc);
+        snprintf(body, sizeof body, "{\"fps\":%.1f,\"mbps\":%.2f,\"viewers\":%d,\"recording\":%s,\"manual_recording\":%s,\"recording_limit_seconds\":300,\"recording_remaining_seconds\":%lld,\"rec_samples\":%u,\"ring_frames\":%u,\"ring_kb\":%zu,\"frame_age_ms\":%lld,\"webrtc\":%s}",
+                 stat_fps, stat_mbps, live_viewers(), rec_fd >= 0 ? "true" : "false", rec_manual?"true":"false", rec_manual?(rec_manual_until-recording_clock_ms()+999)/1000:0LL, rec_nsamples, ring_count, ring_bytes / 1024, nf ? (now_us() - nf->ts) / 1000 : -1LL, rtc);
         send_json(c, 200, body);
         return;
     }
@@ -883,9 +953,10 @@ static void b64(const char *in, char *out) {
 
 int main(int argc, char **argv) {
     const char *dev = "/dev/video1"; int port = 8080, plfreq = 60, tls_port = 0;
-    const char *tls_cert = NULL, *tls_key = NULL;
+    const char *tls_cert = NULL, *tls_key = NULL, *google_config = NULL;
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "-d")) dev = h264_dev = argv[i + 1];
+        else if (!strcmp(argv[i], "-g")) google_config = argv[i + 1];
         else if (!strcmp(argv[i], "-t")) tls_port = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "-C")) tls_cert = argv[i + 1];
         else if (!strcmp(argv[i], "-K")) tls_key = argv[i + 1];
@@ -898,6 +969,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-c") && argv[i + 1][0]) { char e[128]; b64(argv[i + 1], e); snprintf(auth, sizeof auth, "Basic %s", e); }
     }
     signal(SIGPIPE, SIG_IGN); signal(SIGCHLD, SIG_IGN);
+    signal(SIGHUP,reload_tls_signal);
+    google_set_controls(google_camera_control);
+    google_init(google_config);
     for (int i = 0; i < MAXCLI; i++) cli[i].fd = -1;
     vfd = cam_open(dev, v4l2_fourcc('H', '2', '6', '4'), 1280, 720, NBUF);
     if (vfd < 0) die("H.264 capture");
@@ -921,20 +995,30 @@ int main(int argc, char **argv) {
 
     struct pollfd pf[MAXCLI + 3];
     for (;;) {
-        int np = 0;
+        if(reload_tls) {
+            reload_tls=0;
+            if(tfd>=0 && tls_init(tls_cert,tls_key)) fprintf(stderr,"tls: reload rejected; keeping previous certificate\n");
+        }
+        int np = 0, buffered_input = 0;
         pf[np].fd = vfd; pf[np].events = POLLIN; np++;
         pf[np].fd = lfd; pf[np].events = POLLIN; np++;
         int tidx = -1; if (tfd >= 0) { tidx = np; pf[np].fd = tfd; pf[np].events = POLLIN; np++; }
         int firstcli = np;
         for (int i = 0; i < MAXCLI; i++) if (cli[i].fd >= 0) {
-            short ev = cli[i].phase == P_REQ ? POLLIN : (cli[i].phase == P_LIVE_WAIT || cli[i].phase == P_CLOSING) ? 0 : POLLOUT;
+            short ev = cli[i].phase == P_REQ ? POLLIN : (cli[i].phase == P_LIVE_WAIT || cli[i].phase == P_CLOSING || cli[i].phase == P_HLS_WAIT) ? 0 : POLLOUT;
             if (cli[i].tls) ev |= tls_want_events(cli[i].tls);
+            if (cli[i].phase == P_REQ && cli[i].tls && tls_has_input(cli[i].tls)) buffered_input = 1;
             pf[np].fd = cli[i].fd; pf[np].events = ev; np++;
         }
-        if (poll(pf, np, 1000) < 0) { if (errno == EINTR) continue; die("poll"); }
+        if (poll(pf, np, buffered_input ? 0 : 1000) < 0) { if (errno == EINTR) continue; die("poll"); }
         int k = 0;
         if (pf[k++].revents & POLLIN) {
             cam_grab();
+            hls_tick();
+            for (int i = 0; i < MAXCLI; i++) if (cli[i].fd >= 0 && cli[i].phase == P_HLS_WAIT) {
+                hls_request(&cli[i], "/hls/live.m3u8", cli[i].hls_token);
+                if (cli[i].phase != P_HLS_WAIT) cli_after_write(&cli[i], cli_write(&cli[i]));
+            }
             for (int i = 0; i < MAXCLI; i++) if (cli[i].fd >= 0 && cli[i].phase == P_LIVE_WAIT) {
                 const struct hframe *f = live_next(&cli[i]);
                 if (f) { live_prepare(&cli[i], f); cli_after_write(&cli[i], cli_write(&cli[i])); }
@@ -950,11 +1034,15 @@ int main(int argc, char **argv) {
             if (j == MAXCLI) { close(fd); continue; }
             fcntl(fd, F_SETFL, O_NONBLOCK); setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
             memset(&cli[j], 0, sizeof cli[j]); cli[j].fd = fd; cli[j].phase = P_REQ; cli[j].local = ntohl(peer.sin_addr.s_addr) == 0x7f000001;
+            cli[j].activity = time(NULL);
             if (li == 1) { cli[j].tls = tls_accept(fd); if (!cli[j].tls) { close(fd); cli[j].fd = -1; } }
         }
         for (int i = 0; i < MAXCLI; i++) if (cli[i].fd >= 0) {
             struct pollfd *p = NULL; for (int m = firstcli; m < np; m++) if (pf[m].fd == cli[i].fd) { p = &pf[m]; break; }
-            if (!p || !p->revents) continue;
+            /* A request can span the HTTP header buffer while its remaining
+             * body is already decrypted in BearSSL. No new socket event will
+             * arrive for those bytes: drain them before waiting again. */
+            if (!p || (!p->revents && !(cli[i].phase == P_REQ && cli[i].tls && tls_has_input(cli[i].tls)))) continue;
             if (p->revents & (POLLERR | POLLHUP | POLLNVAL)) { cli_close(&cli[i]); continue; }
             struct client *c = &cli[i];
             if (c->tls && tls_pump(c->tls, p->revents & POLLIN, p->revents & POLLOUT) < 0) { cli_close(c); continue; }
@@ -965,6 +1053,7 @@ int main(int argc, char **argv) {
                     if (n < 0) { cli_close(c); continue; }
                     if (n == 0) { if (c->tls && tls_pump(c->tls, 0, 1) < 0) cli_close(c); continue; }
                     c->body_len += n;
+                    c->body[c->body_len] = 0;
                     if (c->body_len == c->body_want) { handle_request(c); if (c->fd >= 0 && c->phase != P_REQ) cli_after_write(c, cli_write(c)); }
                     else if (c->tls && tls_pump(c->tls, 0, 1) < 0) cli_close(c);
                     continue;
@@ -974,13 +1063,18 @@ int main(int argc, char **argv) {
                 if (n == 0) { if (c->tls && tls_pump(c->tls, 0, 1) < 0) cli_close(c); continue; }
                 c->reqlen += n; c->req[c->reqlen] = 0;
                 char *hend = strstr(c->req, "\r\n\r\n");
-                if (hend && !strncmp(c->req, "POST ", 5) && strstr(c->req, "action=save")) {
+                int signaling = !strncmp(c->req, "POST /google/", 13) || !strncmp(c->req, "POST /viewer/webrtc ", 20);
+                if (hend && !strncmp(c->req, "POST ", 5) && (strstr(c->req, "action=save") || signaling)) {
                     /* Start collecting the body (headers stay in req; any body bytes already read move over). */
-                    const char *cl = strstr(c->req, "Content-Length:"); size_t want = cl ? strtoul(cl + 15, NULL, 10) : 0;
-                    if (!want || want > 2 * 1024 * 1024) { cli_close(c); continue; }
-                    c->body = malloc(want); c->body_want = want; c->body_len = c->reqlen - (hend + 4 - c->req);
+                    char cl[32], te[64], *ce; size_t want = google_header(c->req, "Content-Length", cl, sizeof cl) ? strtoul(cl, &ce, 10) : 0;
+                    size_t limit = signaling ? 16384 : 2 * 1024 * 1024;
+                    if (!want || *ce || want > limit || google_header(c->req, "Transfer-Encoding", te, sizeof te)) { cli_close(c); continue; }
+                    c->body_want = want; c->body_len = c->reqlen - (hend + 4 - c->req);
+                    if (c->body_len > want) { cli_close(c); continue; }
+                    c->body = malloc(want + 1);
                     if (!c->body) { cli_close(c); continue; }
                     memcpy(c->body, hend + 4, c->body_len); c->reqlen = hend + 4 - c->req; c->req[c->reqlen] = 0;
+                    c->body[c->body_len] = 0;
                     if (c->body_len == c->body_want) { handle_request(c); if (c->fd >= 0 && c->phase != P_REQ) cli_after_write(c, cli_write(c)); }
                     continue;
                 }
@@ -992,6 +1086,8 @@ int main(int argc, char **argv) {
             } else if (c->tls && c->fd >= 0 && tls_pump(c->tls, 0, 1) < 0) cli_close(c);
         }
         time_t now = time(NULL);
+        rec_expire();
+        for (int i = 0; i < MAXCLI; i++) if (cli[i].fd >= 0 && !cli[i].live && now - cli[i].activity > 30) cli_close(&cli[i]);
         if (last_frame_time && now - last_frame_time > 10) { fprintf(stderr, "no frames for 10 s, exiting for restart\n"); rec_stop(); exit(3); }
         if (rec_fd >= 0 && now - rec_last_write > REC_IDLE_CLOSE) { fprintf(stderr, "recording idle, closing\n"); rec_stop(); }
     }

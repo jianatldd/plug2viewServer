@@ -128,7 +128,7 @@
 </main>
 <footer><span id="status">connecting…</span><span id="ptz"></span><span id="info"></span></footer>
 <script>
-  // Video comes from mjpg-streamer on this origin (?action=stream / ?action=snapshot).
+  // Live video uses WebRTC, with fragmented MP4 and snapshot fallbacks.
   // Pan/tilt, IR-cut and Wi-Fi calls go to /api/..., which camd relays to `hkctl serve`
   // on the camera's localhost — same origin, same (optional) password, one port to forward.
   const CTL = '/api';
@@ -141,13 +141,85 @@
   const ptz = document.getElementById('ptz');
   let live = false, range = null;
 
-  // ---- live view: H.264 in fragmented MP4 from /?action=fmp4, played through Media
-  // Source Extensions in a normal <video> element. (WebCodecs would need HTTPS; MSE works on
-  // plain HTTP.) Browsers without MSE (iPhones before iOS 17.1) get a 2 s snapshot refresh.
+  // ---- live view: WebRTC first; MP4/MSE when unavailable or the RTC slot is busy.
   const MS = window.MediaSource || window.ManagedMediaSource;
   const haveMse = !!MS;
   let mse = { abort: null, ms: null, sb: null, url: null, retry: null, lastData: 0, queue: [], frames: 0, t0: 0 };
   function showLive(el) { cv.hidden = el !== cv; img.hidden = el !== img; vid.hidden = el !== vid; }
+
+  let rtc = null;
+  async function viewerSignal(body, keepalive = false) {
+    const r = await fetch('/viewer/webrtc', { method: 'POST', cache: 'no-store',
+      credentials: 'same-origin', keepalive, signal: AbortSignal.timeout(15000),
+      headers: { 'Content-Type': 'application/json', 'X-Plug2View-Viewer': '1' },
+      body: JSON.stringify(body) });
+    if (!r.ok) throw new Error('WebRTC HTTP ' + r.status);
+    return r.json();
+  }
+  function endSession(session) {
+    if (session) return viewerSignal({ action: 'end', session }, true).catch(() => {});
+    return Promise.resolve();
+  }
+  let rtcEnding = Promise.resolve();
+  function stopRtc() {
+    const old = rtc; rtc = null;
+    if (!old) return;
+    clearInterval(old.timer);
+    old.pc.close();
+    if (vid.srcObject) { vid.srcObject.getTracks().forEach(t => t.stop()); vid.srcObject = null; }
+    rtcEnding = endSession(old.session);
+  }
+  function startFallback() {
+    if (!live) return;
+    stopRtc();
+    if (haveMse) { showLive(vid); startMse(); }
+    else { showLive(img); startSnapshots(); }
+  }
+  async function startRtc() {
+    const current = rtc = { pc: new RTCPeerConnection({ iceServers: [] }), session: null,
+      timer: null, frames: 0, t0: performance.now(), lastFrame: performance.now(), lastTime: -1 };
+    const pc = current.pc;
+    const active = () => live && rtc === current;
+    const fallback = () => { if (active()) startFallback(); };
+    showLive(vid); vid.muted = true; vid.autoplay = true; vid.playsInline = true; vid.controls = false;
+    status.textContent = 'connecting…'; status.className = '';
+    pc.ontrack = e => {
+      if (!active() || e.track.kind !== 'video') return;
+      vid.srcObject = new MediaStream([e.track]); vid.play().catch(() => {});
+    };
+    pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') fallback(); };
+    current.timer = setInterval(() => {
+      if (!active()) return;
+      const now = performance.now();
+      // Also works on browsers without requestVideoFrameCallback.
+      if (!vid.paused && vid.readyState >= 2 && vid.currentTime !== current.lastTime) {
+        current.lastTime = vid.currentTime;
+        if (!vid.requestVideoFrameCallback) current.lastFrame = now;
+        status.textContent = 'live'; status.className = '';
+        info.textContent = vid.videoWidth + '×' + vid.videoHeight + ' H.264';
+      }
+      if (now - current.lastFrame > 12000) fallback();
+    }, 1000);
+    try {
+      await rtcEnding;
+      if (!active()) return;
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      await pc.setLocalDescription(await pc.createOffer());
+      if (pc.iceGatheringState !== 'complete') await new Promise(resolve => {
+        const done = () => { clearTimeout(timer); pc.removeEventListener('icegatheringstatechange', changed); resolve(); };
+        const changed = () => { if (pc.iceGatheringState === 'complete') done(); };
+        const timer = setTimeout(done, 2000);
+        pc.addEventListener('icegatheringstatechange', changed);
+      });
+      if (!active()) return;
+      const answer = await viewerSignal({ action: 'offer', sdp: pc.localDescription.sdp });
+      // A paused/hidden page must release a session even if its answer arrives late.
+      if (!active()) { await endSession(answer.session); return; }
+      current.session = answer.session;
+      await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+    } catch (e) { fallback(); }
+  }
 
   function startMse() {
     stopMse();
@@ -221,6 +293,8 @@
   vid.addEventListener('error', () => { if (live && mse.abort) { status.textContent = 'video error — restarting'; status.className = 'off'; scheduleRestart(); } });
   // fps readout from the video element's own frame callback
   if (vid.requestVideoFrameCallback) {
+    const rtcFrame = () => { if (live && rtc) rtc.lastFrame = performance.now(); vid.requestVideoFrameCallback(rtcFrame); };
+    vid.requestVideoFrameCallback(rtcFrame);
     const tick = () => { if (live && mse.abort) { mse.frames++; if (mse.frames % 15 === 0) { const s = (performance.now() - mse.t0) / 1000; status.textContent = `live · ${(mse.frames / s).toFixed(1)} fps`; status.className = ''; if (vid.videoWidth) info.textContent = vid.videoWidth + '×' + vid.videoHeight + ' H.264'; } } vid.requestVideoFrameCallback(tick); };
     vid.requestVideoFrameCallback(tick);
   } else {
@@ -232,13 +306,15 @@
   function stopSnapshots() { clearInterval(snapTimer); snapTimer = null; }
 
   function start() {
+    stopRtc(); stopMse(); stopSnapshots();
     live = true;
     document.getElementById('pause').textContent = 'Pause';
-    if (haveMse) { showLive(vid); startMse(); } else { showLive(img); startSnapshots(); }
+    if (typeof RTCPeerConnection === 'function' && typeof AbortSignal.timeout === 'function') startRtc().catch(startFallback);
+    else startFallback();
   }
   function stop() {
     live = false;
-    stopMse(); stopSnapshots();
+    stopRtc(); stopMse(); stopSnapshots();
     document.getElementById('pause').textContent = 'Resume';
     status.textContent = 'paused';
   }
@@ -258,6 +334,7 @@
     else if (el.requestFullscreen) el.requestFullscreen();
   };
   document.addEventListener('visibilitychange', () => { if (document.hidden) { if (document.getElementById('player').hidden) stop(); } else if (document.getElementById('player').hidden) start(); });
+  window.addEventListener('pagehide', stop);
 
   // ---- controls ----
   let busy = false;

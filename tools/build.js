@@ -3,6 +3,7 @@
 // https://ziglang.org/download/ (Windows zip), then:
 //
 //   node tools/build.js [--zig <path-to-zig(.exe)>] [camd|hkctl|vidcap|bearssl ...]
+// Add --webrtc for camd after running tools/build-webrtc.js (pinned DTLS/SRTP).
 //
 // Zig is found from --zig, $ZIG, or `zig` on PATH. BearSSL (https://bearssl.org, MIT) is
 // built from its source tree into camera/src/bearssl/libbearssl.a when asked for
@@ -17,6 +18,7 @@ const root = path.resolve(__dirname, '..');
 const argv = process.argv.slice(2);
 const opt = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : null; };
 const zig = opt('--zig') || process.env.ZIG || 'zig';
+const webrtc = argv.includes('--webrtc');
 const targets = argv.filter(a => !a.startsWith('--') && a !== opt('--zig') && a !== opt('--bearssl-src'));
 const want = targets.length ? targets : ['camd', 'hkctl', 'vidcap'];
 const TARGET = ['-target', 'mipsel-linux-musleabi', '-mcpu=mips32', '-Os', '-static', '-s'];
@@ -29,7 +31,7 @@ function cc(args, label) {
 }
 
 for (const t of want) {
-  if (t === 'camd') cc(['-Icamera/src', '-o', 'camera/payload/camd', 'camera/src/camd.c', 'camera/src/tls.c', 'camera/src/bearssl/libbearssl.a'], 'camd');
+  if (t === 'camd') cc(['-Icamera/src', ...(webrtc ? ['-DP2V_WEBRTC', '-DMBEDTLS_CONFIG_FILE="webrtc-mbedtls.h"', '-I.build/webrtc/mbedtls/include', '-I.build/webrtc/libsrtp/include', '-pthread'] : []), '-o', 'camera/payload/camd', 'camera/src/camd.c', 'camera/src/tls.c', 'camera/src/google.c', ...(webrtc ? ['camera/src/webrtc.c', '.build/webrtc/libwebrtc.a'] : []), 'camera/src/bearssl/libbearssl.a', '-Wl,--gc-sections'], 'camd');
   else if (t === 'hkctl') cc(['-o', 'camera/payload/hkctl', 'camera/src/hkctl.c'], 'hkctl');
   else if (t === 'vidcap') cc(['-o', 'camera/payload/vidcap', 'camera/src/vidcap.c'], 'vidcap');
   else if (t === 'bearssl') {

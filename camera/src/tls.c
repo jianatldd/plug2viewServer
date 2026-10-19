@@ -23,13 +23,17 @@
 #include "bearssl/inc/bearssl.h"
 #include "tls.h"
 
-static unsigned char *cert_der = NULL; static size_t cert_len = 0;
-static br_x509_certificate chain[1];
-static br_skey_decoder_context skey;
-static const br_ec_private_key *eckey = NULL;
-static br_ssl_session_cache_lru lru;
-static unsigned char lru_buf[8192];
-static int ready = 0;
+struct tls_config {
+    unsigned char *cert_der; size_t cert_len,chain_len;
+    br_x509_certificate chain[5];
+    br_skey_decoder_context skey;
+    const br_ec_private_key *eckey;
+    br_ssl_session_cache_lru lru;
+    unsigned char lru_buf[8192];
+    unsigned refs;
+};
+static struct tls_config *active;
+static void config_release(struct tls_config *c) { if(c && !--c->refs) { free(c->cert_der);free(c); } }
 
 static unsigned char *read_file(const char *path, size_t *len) {
     int fd = open(path, O_RDONLY);
@@ -43,40 +47,65 @@ static unsigned char *read_file(const char *path, size_t *len) {
 }
 
 int tls_init(const char *cert_path, const char *key_path) {
+    struct tls_config *c=calloc(1,sizeof *c);if(!c)return -1;c->refs=1;
     size_t klen; unsigned char *key = read_file(key_path, &klen);
-    cert_der = read_file(cert_path, &cert_len);
-    if (!key || !cert_der) { fprintf(stderr, "tls: cannot read %s / %s\n", cert_path, key_path); free(key); return -1; }
-    br_skey_decoder_init(&skey);
-    br_skey_decoder_push(&skey, key, klen);
+    c->cert_der = read_file(cert_path, &c->cert_len);
+    if (!key || !c->cert_der) { fprintf(stderr, "tls: cannot read %s / %s\n", cert_path, key_path); free(key); goto bad; }
+    br_skey_decoder_init(&c->skey);
+    br_skey_decoder_push(&c->skey, key, klen);
     free(key);
-    if (br_skey_decoder_last_error(&skey) != 0 || br_skey_decoder_key_type(&skey) != BR_KEYTYPE_EC) {
-        fprintf(stderr, "tls: key must be an EC (P-256) private key in PKCS#8 DER (error %d)\n", br_skey_decoder_last_error(&skey));
-        return -1;
+    if (br_skey_decoder_last_error(&c->skey) != 0 || br_skey_decoder_key_type(&c->skey) != BR_KEYTYPE_EC) {
+        fprintf(stderr, "tls: invalid EC private key\n");goto bad;
     }
-    eckey = br_skey_decoder_get_ec(&skey);
-    chain[0].data = cert_der; chain[0].data_len = cert_len;
-    br_ssl_session_cache_lru_init(&lru, lru_buf, sizeof lru_buf);
-    ready = 1;
-    fprintf(stderr, "tls: EC key and %zu-byte certificate loaded\n", cert_len);
+    c->eckey = br_skey_decoder_get_ec(&c->skey);
+    if(c->eckey->curve!=BR_EC_secp256r1)goto bad;
+    /* cert.der may contain concatenated DER certificates, leaf first. Public CAs
+     * require the intermediate chain; the original one-certificate file still works. */
+    size_t pos = 0;
+    while (pos < c->cert_len) {
+        if (c->chain_len == 5 || c->cert_len - pos < 2 || c->cert_der[pos] != 0x30) goto bad;
+        size_t head = 2, len = c->cert_der[pos + 1];
+        if (len & 0x80) {
+            unsigned count = len & 0x7f; len = 0;
+            if (!count || count > 3 || c->cert_len - pos < 2 + count) goto bad;
+            for (unsigned i = 0; i < count; i++) len = (len << 8) | c->cert_der[pos + 2 + i];
+            head += count;
+        }
+        if (!len || len > c->cert_len - pos - head) goto bad;
+        c->chain[c->chain_len].data = c->cert_der + pos; c->chain[c->chain_len++].data_len = head + len;
+        pos += head + len;
+    }
+    br_x509_decoder_context dc; br_x509_decoder_init(&dc,NULL,NULL);
+    br_x509_decoder_push(&dc,c->chain[0].data,c->chain[0].data_len);
+    const br_x509_pkey *pk=br_x509_decoder_get_pkey(&dc);
+    unsigned char pub[65];size_t plen=br_ec_get_default()->mulgen(pub,c->eckey->x,c->eckey->xlen,c->eckey->curve);
+    if(!pk||pk->key_type!=BR_KEYTYPE_EC||pk->key.ec.curve!=c->eckey->curve||pk->key.ec.qlen!=plen||memcmp(pub,pk->key.ec.q,plen))goto bad;
+    br_ssl_session_cache_lru_init(&c->lru, c->lru_buf, sizeof c->lru_buf);
+    struct tls_config *old=active;active=c;config_release(old);
+    fprintf(stderr, "tls: EC key and %zu-byte certificate loaded\n", c->cert_len);
     return 0;
+bad:
+    config_release(c);return -1;
 }
 
-int tls_ready(void) { return ready; }
+int tls_ready(void) { return active!=NULL; }
 
 struct tlsconn {
     br_ssl_server_context cc;
     unsigned char iobuf[BR_SSL_BUFSIZE_BIDI];
     int fd;
+    struct tls_config *config;
 };
 
 struct tlsconn *tls_accept(int fd) {
-    if (!ready) return NULL;
+    if (!active) return NULL;
     struct tlsconn *t = calloc(1, sizeof *t);
     if (!t) return NULL;
     t->fd = fd;
-    br_ssl_server_init_full_ec(&t->cc, chain, 1, BR_KEYTYPE_EC, eckey);
+    t->config=active;active->refs++;
+    br_ssl_server_init_full_ec(&t->cc, active->chain, active->chain_len, BR_KEYTYPE_EC, active->eckey);
     br_ssl_engine_set_buffer(&t->cc.eng, t->iobuf, sizeof t->iobuf, 1);
-    br_ssl_server_set_cache(&t->cc, &lru.vtable);
+    br_ssl_server_set_cache(&t->cc, &active->lru.vtable);
     /* extra entropy for the engine's PRNG from the kernel */
     unsigned char seed[32]; int r = open("/dev/urandom", O_RDONLY);
     if (r >= 0) { if (read(r, seed, sizeof seed) == (ssize_t)sizeof seed) br_ssl_engine_inject_entropy(&t->cc.eng, seed, sizeof seed); close(r); }
@@ -84,9 +113,10 @@ struct tlsconn *tls_accept(int fd) {
     return t;
 }
 
-void tls_free(struct tlsconn *t) { free(t); }
+void tls_free(struct tlsconn *t) { if(t)config_release(t->config);free(t); }
 
 int tls_closed(struct tlsconn *t) { return (br_ssl_engine_current_state(&t->cc.eng) & BR_SSL_CLOSED) != 0; }
+int tls_has_input(struct tlsconn *t) { return (br_ssl_engine_current_state(&t->cc.eng) & BR_SSL_RECVAPP) != 0; }
 void tls_close(struct tlsconn *t) { br_ssl_engine_close(&t->cc.eng); }
 int tls_flushed(struct tlsconn *t) { unsigned st = br_ssl_engine_current_state(&t->cc.eng); return (st & BR_SSL_CLOSED) || !(st & BR_SSL_SENDREC); }
 int tls_error(struct tlsconn *t) { return br_ssl_engine_last_error(&t->cc.eng); }

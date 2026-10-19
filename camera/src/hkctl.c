@@ -27,6 +27,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
+#include "camera-presets.h"
+#include "recording-policy.h"
 
 #define IOC_STEP_A   1018   /* one step: h axis = toward x 0, v axis = down (toward y 0) */
 #define IOC_STEP_B   1019   /* one step: h axis = toward x max, v axis = up (toward y max) */
@@ -100,11 +103,15 @@ static int neck_status(int fd) { return ioctl(fd, IOC_STATUS, 0); }
 /* Step `n` times on one axis in one direction. Returns steps actually taken.
  * dir > 0 moves toward the axis maximum, dir < 0 toward 0. */
 static int neck_step(int fd, int axis, int dir, int n, int delay_us, int *pos, int lo, int hi) {
+    if(n<=0 || (pos && ((dir>0 && *pos>=hi) || (dir<0 && *pos<=lo)))) return 0;
+    int guard=motion_guard_begin();
+    if(guard<0) { perror("motion guard"); return 0; }
     int cmd, lim;
     if (axis == AXIS_H) { cmd = dir > 0 ? IOC_STEP_B : IOC_STEP_A; lim = dir > 0 ? LIM_H_B : LIM_H_A; }
     else                { cmd = dir > 0 ? IOC_STEP_B : IOC_STEP_A; lim = dir > 0 ? LIM_V_B : LIM_V_A; }
     int done = 0;
     for (; done < n; done++) {
+        if(done && done%250==0 && !motion_guard_refresh(guard)) break;
         if (pos && ((dir > 0 && *pos >= hi) || (dir < 0 && *pos <= lo))) break;  /* software range */
         int st = neck_status(fd);
         if (st < 0) { perror("status"); break; }
@@ -118,6 +125,7 @@ static int neck_step(int fd, int axis, int dir, int n, int delay_us, int *pos, i
         if (pos) *pos += dir > 0 ? 1 : -1;
         usleep(delay_us);
     }
+    motion_guard_end(guard);
     return done;
 }
 
@@ -127,6 +135,11 @@ static void neck_release(int fd) { ioctl(fd, IOC_RELEASE, 0); }
 static int cmd_neck(int argc, char **argv) {
     if (argc < 3) return 1;
     const char *sub = argv[2];
+    int preset_lock=-1;
+    if(!strcmp(sub,"preset")) {
+        preset_lock=open("/tmp/neck.lock",O_RDWR|O_CREAT,0644);
+        if(preset_lock<0 || flock(preset_lock,LOCK_EX)<0) { if(preset_lock>=0) close(preset_lock); return 4; }
+    }
     int fd = open_dev("/dev/neck");
     int x = -1, y = -1, have_pos = load_pos(&x, &y) == 0;
 
@@ -163,11 +176,16 @@ static int cmd_neck(int argc, char **argv) {
         neck_release(fd);
         save_pos(x, y);
         printf("homed (%d h, %d v steps to switches); position=%d %d\n", hx, vy, x, y);
-    } else if (!strcmp(sub, "goto")) {
-        if (argc < 5) { close(fd); return 1; }
+    } else if (!strcmp(sub, "goto") || !strcmp(sub,"preset")) {
+        int is_preset=!strcmp(sub,"preset");
+        if (argc < (is_preset?4:5)) { close(fd); return 1; }
         if (!have_pos) { fprintf(stderr, "position unknown - run: hkctl neck home\n"); close(fd); return 3; }
-        int tx = atoi(argv[3]), ty = atoi(argv[4]);
-        int delay = argc > 5 ? atoi(argv[5]) : DEFAULT_DELAY_US;
+        int tx,ty;
+        if(is_preset) {
+            char *end; long index=strtol(argv[3],&end,10); int px,py; load_park(&px,&py);
+            if(*end || index<0 || index>10 || !camera_preset_target((int)index,px,py,&tx,&ty)) { close(fd); close(preset_lock); return 1; }
+        } else { tx=atoi(argv[3]); ty=atoi(argv[4]); }
+        int delay = !is_preset && argc > 5 ? atoi(argv[5]) : DEFAULT_DELAY_US;
         if (tx < X_MIN_SOFT) tx = X_MIN_SOFT; if (tx > X_MAX_SOFT) tx = X_MAX_SOFT;
         if (ty < Y_MIN_SOFT) ty = Y_MIN_SOFT; if (ty > Y_MAX_SOFT) ty = Y_MAX_SOFT;
         neck_step(fd, AXIS_H, tx > x ? 1 : -1, abs(tx - x), delay, &x, X_MIN_SOFT, X_MAX_SOFT);
@@ -177,6 +195,7 @@ static int cmd_neck(int argc, char **argv) {
         printf("position=%d %d limits=0x%x\n", x, y, neck_status(fd));
     } else { close(fd); return 1; }
     close(fd);
+    if(preset_lock>=0) close(preset_lock);
     return 0;
 }
 
@@ -253,7 +272,7 @@ static int qparam(const char *q, const char *key, int *out) {
 struct mcfg { int on, threshold, zones, confirm; };
 static int motion_enabled(void);
 static void motion_cfg(struct mcfg *m);
-static void motion_cfg_save(const struct mcfg *m);
+static int motion_cfg_save(const struct mcfg *m);
 
 /* ---- Wi-Fi helpers (shell out to the Ralink iwpriv tools via wifi.sh) ------- */
 #define WIFI_CONF "/mnt/sif/owrt/wifi.conf"
@@ -466,7 +485,7 @@ static void handle(int c) {
         if (qparam(q, "threshold", &v)) { m.threshold = v < 0 ? 0 : v > 65535 ? 65535 : v; changed = 1; }
         if (qparam(q, "zones", &v)) { m.zones = v & 511; changed = 1; }
         if (qparam(q, "confirm", &v)) { m.confirm = v < 1 ? 1 : v > 10 ? 10 : v; changed = 1; }
-        if (changed) motion_cfg_save(&m);        /* the daemon notices the mtime and applies it */
+        if (changed && !motion_cfg_save(&m)) { respond(c,500,"{\"error\":\"cannot save motion settings\"}"); return; }
         char st[400] = "{}";
         FILE *f = fopen(MOTION_STATE, "r");
         if (f) { if (!fgets(st, sizeof st, f)) strcpy(st, "{}"); fclose(f); }
@@ -533,9 +552,12 @@ static void motion_cfg(struct mcfg *m) {
     if (m->threshold < 0 || m->threshold > 65535) m->threshold = 273;
     if (m->confirm < 1 || m->confirm > 10) m->confirm = 2;
 }
-static void motion_cfg_save(const struct mcfg *m) {
-    FILE *f = fopen(MOTION_CONF, "w");
-    if (f) { fprintf(f, "MOTION=%d\nTHRESHOLD=%d\nZONES=%d\nCONFIRM=%d\n", m->on, m->threshold, m->zones, m->confirm); fclose(f); }
+static int motion_cfg_save(const struct mcfg *m) {
+    char tmp[160]; snprintf(tmp,sizeof tmp,"%s.%ld.tmp",MOTION_CONF,(long)getpid());
+    FILE *f = fopen(tmp, "w"); if(!f) return 0;
+    int ok=fprintf(f, "MOTION=%d\nTHRESHOLD=%d\nZONES=%d\nCONFIRM=%d\n", m->on, m->threshold, m->zones, m->confirm)>=0;
+    if(fclose(f)) ok=0;
+    if(!ok || rename(tmp,MOTION_CONF)) { remove(tmp); return 0; } return 1;
 }
 static int motion_enabled(void) { struct mcfg m; motion_cfg(&m); return m.on; }
 
@@ -578,14 +600,17 @@ static int local_get(int port, const char *path, char *resp, int n) {
 
 static int cmd_motion(int argc, char **argv) {
     int port = argc > 2 ? atoi(argv[2]) : 8080;
-    time_t active_until = 0, last_save = 0, last_event = 0, cfg_mtime = -1; unsigned saved = 0, events = 0;
+    time_t active_until = 0, last_save = 0, last_event = 0; unsigned saved = 0, events = 0;
     int streak = 0;                              /* consecutive polls with motion (debounce) */
-    struct mcfg m;
+    struct mcfg m={-1,0,0,0};
     fprintf(stderr, "motion daemon: polling, saving to video port %d\n", port);
     for (;;) {
-        struct stat st; time_t mt = stat(MOTION_CONF, &st) == 0 ? st.st_mtime : 0;
-        if (mt != cfg_mtime) { cfg_mtime = mt; motion_cfg(&m); motion_apply(&m); }
-        int mask = m.on ? motion_poll() : 0;       /* polled even when idle so the UI can show zones */
+        struct mcfg next; motion_cfg(&next);
+        if(next.on!=m.on || next.threshold!=m.threshold || next.zones!=m.zones || next.confirm!=m.confirm) { m=next; motion_apply(&m); }
+        int suppressed=motion_suppressed();
+        int mask = m.on ? motion_poll() : 0;       /* Drain hardware results even during movement. */
+        suppressed = suppressed || motion_suppressed();
+        if(suppressed || !m.on) { mask=0; streak=0; active_until=0; }
         time_t now = time(NULL);
         int started = 0;
         streak = mask > 0 ? streak + 1 : 0;
@@ -604,13 +629,13 @@ static int cmd_motion(int argc, char **argv) {
             if (started || !recording) { recording = local_get(port, "/?action=rec&start=1&tag=motion&pre=1", resp, sizeof resp); if (recording) saved++; }
             last_save = now;
         } else if (recording) {
-            local_get(port, "/?action=rec&stop=1", resp, sizeof resp); recording = 0;
+            local_get(port, "/?action=rec&stop=1&tag=motion", resp, sizeof resp); recording = 0;
         }
         FILE *f = fopen(MOTION_STATE, "w");
         if (f) { fprintf(f, "{\"enabled\":%s,\"active\":%s,\"mask\":%d,\"events\":%u,\"saved\":%u,\"last_event\":%ld,"
-                            "\"threshold\":%d,\"zones\":%d,\"confirm\":%d}\n",
+                            "\"threshold\":%d,\"zones\":%d,\"confirm\":%d,\"suppressed\":%s}\n",
                          m.on ? "true" : "false", now < active_until ? "true" : "false", mask < 0 ? 0 : mask, events, saved, (long)last_event,
-                         m.threshold, m.zones, m.confirm); fclose(f); }
+                         m.threshold, m.zones, m.confirm, suppressed?"true":"false"); fclose(f); }
         usleep(500000);                           /* 2 polls/s: ~1 s to trigger with confirm=2 */
     }
 }

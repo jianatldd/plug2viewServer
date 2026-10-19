@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Plug2View playback check</title>
+<style>body{font:18px system-ui;margin:20px;background:#15191d;color:#eee}video{width:100%;max-width:720px;background:#000}button{font:inherit;padding:12px 22px;margin:12px 0}pre{white-space:pre-wrap;font:16px monospace}</style>
+<h1>Phone playback check</h1>
+<p>Close the camera in Google Home and on the Hub, then tap Start. This checks 30 seconds of video.</p>
+<video autoplay muted playsinline controls></video><br>
+<button id="start">Start</button>
+<pre id="status">Ready.</pre>
+<script>
+'use strict';
+// Replaced by prepare-webrtc-phone.js. Only a short-lived, device-scoped stream
+// token is installed here, behind the existing camera viewer authentication.
+const token = __STREAM_TOKEN__;
+const expires = __STREAM_EXPIRES__;
+let pc, timer, ending = false, last = {}, started;
+const status = document.querySelector('#status'), video = document.querySelector('video');
+async function signal(action, sdp) {
+  const res = await fetch('/google/webrtc', {method:'POST', cache:'no-store',
+    headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},
+    body:JSON.stringify({action,deviceId:'plug2view',sdp})});
+  if(!res.ok) throw new Error('Signaling HTTP '+res.status+'; the check may need to be prepared again.');
+  return res.json();
+}
+function show(done=false) {
+  status.textContent=(done?'Check finished.':'Checking playback…')+'\n'+
+    'Connection: '+(pc?.connectionState||'starting')+'\n'+
+    'Decoded frames: '+(last.framesDecoded||0)+'\n'+
+    'Video size: '+video.videoWidth+' × '+video.videoHeight+'\n'+
+    'Packets received: '+(last.packetsReceived||0)+'\n'+
+    'Packets lost: '+(last.packetsLost||0)+'\n'+
+    (done?'Please report whether the picture moved and the decoded-frame count.':'');
+}
+async function finish() {
+  if(ending) return; ending=true; clearInterval(timer);
+  show(true); pc?.close(); await signal('end').catch(()=>{});
+}
+document.querySelector('#start').onclick=async()=>{
+  document.querySelector('#start').disabled=true;
+  try {
+    if(Date.now()>expires) throw new Error('This check expired; please ask to prepare it again.');
+    pc=new RTCPeerConnection({iceServers:[]});
+    pc.ontrack=e=>{if(e.track.kind==='video'){video.srcObject=new MediaStream([e.track]);video.play().catch(()=>{});}};
+    pc.addTransceiver('audio',{direction:'recvonly'});
+    pc.addTransceiver('video',{direction:'recvonly'});
+    await pc.setLocalDescription(await pc.createOffer());
+    if(pc.iceGatheringState!=='complete') await new Promise(resolve=>{
+      const timeout=setTimeout(resolve,4000);
+      pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete'){clearTimeout(timeout);resolve();}});
+    });
+    const answer=await signal('offer',pc.localDescription.sdp);
+    await pc.setRemoteDescription({type:'answer',sdp:answer.sdp});
+    started=Date.now();show();
+    timer=setInterval(async()=>{
+      if(ending)return;
+      const stats=[...(await pc.getStats()).values()];
+      last=stats.find(s=>s.type==='inbound-rtp'&&s.kind==='video')||{};
+      show();if(Date.now()-started>=30000)await finish();
+    },1000);
+  } catch(e) {status.textContent=e.message;pc?.close();}
+};
+window.addEventListener('pagehide',()=>{pc?.close();});
+</script>
