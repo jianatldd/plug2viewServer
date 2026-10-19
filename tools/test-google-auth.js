@@ -4,9 +4,7 @@
 'use strict';
 const assert = require('assert/strict'), fs = require('fs'), https = require('https');
 const args = process.argv.slice(2), configIndex = args.indexOf('--config');
-if (configIndex < 0 || !args[configIndex + 1]) throw new Error('Pass --config CONFIG_FILE');
-const cfg = Object.fromEntries(fs.readFileSync(args[configIndex + 1], 'utf8').split(/\r?\n/)
-  .filter(l => l && !l.startsWith('#')).map(l => { const i = l.indexOf('='); return [l.slice(0, i), l.slice(i + 1)]; }));
+const cfg = require('./config').googleConfig(configIndex >= 0 ? args[configIndex + 1] : undefined);
 const camera = require('./config').cameraAddress(args);
 const origin = new URL(cfg.PUBLIC_ORIGIN);
 const redirect = 'https://oauth-redirect.googleusercontent.com/r/' + cfg.PROJECT_ID;
@@ -17,7 +15,7 @@ function request(query, data, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const headers = {host: origin.host, ...extraHeaders};
     if (body !== undefined) Object.assign(headers, {'content-type': 'application/x-www-form-urlencoded', 'content-length': Buffer.byteLength(body)});
-    const q = https.request({host: camera, port: 8443, servername: origin.hostname,
+    const q = https.request({host: camera, port:require('./config').servicePort('TLS_PORT'), servername: origin.hostname,
       path: '/google/auth' + (query ? '?' + query : ''), method: body === undefined ? 'GET' : 'POST', headers, agent: false}, res => {
       const chunks = []; res.on('data', c => chunks.push(c));
       res.on('end', () => resolve({status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString()}));

@@ -14,7 +14,8 @@ const fs = require('fs');
 
 const { cameraAddress } = require('./config');
 const argv = process.argv.slice(2);
-const opts = { host: cameraAddress(argv), user: 'admin', pass: 'admin', timeout: 60000 };
+const local = require('./config').readLocal();
+const opts = { host: cameraAddress(argv), user: local.telnet?.username || 'admin', pass: local.telnet?.password || 'admin', timeout: 60000 };
 const cmds = [];
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];

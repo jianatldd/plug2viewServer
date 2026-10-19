@@ -1,4 +1,57 @@
 {
-  "_comment": "Copy to config.local.json (git-ignored). The tools read the camera address from here; --camera on the command line overrides it.",
-  "camera": "192.168.1.100"
+  "schemaVersion": 1,
+  "camera": "192.168.1.100",
+  "pc": "",
+  "telnet": {
+    "username": "admin",
+    "password": "admin"
+  },
+  "server": {
+    "PORT": 8080,
+    "TLS_PORT": 8443,
+    "CTL_PORT": 8081,
+    "H264_DEVICE": "/dev/video1",
+    "DEVICE": "/dev/video0",
+    "PLFREQ": 60,
+    "TZ": "EST5EDT,M3.2.0,M11.1.0",
+    "SAVE_DIR": "/media/sda1/plug2view",
+    "CREDENTIALS": "",
+    "TLS_CERT": "",
+    "TLS_KEY": ""
+  },
+  "google": {
+    "enabled": false,
+    "PROJECT_ID": "your-project-id",
+    "PUBLIC_ORIGIN": "https://YOUR_SUBDOMAIN.duckdns.org",
+    "CLIENT_ID": "plug2view-google",
+    "CLIENT_SECRET": "",
+    "LOGIN_USER": "owner",
+    "LOGIN_PASSWORD": "",
+    "TOKEN_KEY": ""
+  },
+  "ddns": {
+    "enabled": false,
+    "HOSTNAME": "YOUR_SUBDOMAIN.duckdns.org",
+    "TOKEN": "",
+    "updateIntervalSeconds": 300
+  },
+  "letsEncrypt": {
+    "enabled": false,
+    "checkIntervalSeconds": 86400,
+    "retryIntervalSeconds": 3600,
+    "renewBeforeDays": 30
+  },
+  "motion": {
+    "MOTION": 0,
+    "THRESHOLD": 273,
+    "ZONES": 511,
+    "CONFIRM": 2
+  },
+  "wifi": {
+    "SSID": "",
+    "PASS": "",
+    "AUTH": "WPA2PSK",
+    "ENC": "AES"
+  },
+  "_comment": "Copy to config.local.json (ignored). For an installed camera use node tools/configure.js --import instead. --check validates; --apply deploys. Set ddns.enabled and letsEncrypt.enabled independently; false disables their schedules."
 }

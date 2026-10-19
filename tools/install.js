@@ -24,7 +24,9 @@ function detectPcIp() {
       if (a.family === 'IPv4' && !a.internal && a.address.startsWith(prefix)) return a.address;
   throw new Error(`no local IPv4 on ${prefix}0/24 — pass --pc <ip>`);
 }
-const pc = opt('--pc', null) || detectPcIp();
+const settings=require('./configuration'),local=settings.readLocal();
+const rendered=local.schemaVersion===1?settings.writeRendered(local):null;
+const pc = opt('--pc', null) || local.pc || detectPcIp();
 
 // Stage everything the camera will fetch into one TFTP directory.
 const stage = path.join(os.tmpdir(), 'plug2view-tftp');
@@ -36,7 +38,7 @@ const files = {
   'camera/wifi.sh': 'wifi.sh', 'camera/wifi-dhcp.sh': 'wifi-dhcp.sh', 'camera/sd.sh': 'sd.sh',
   'camera/www/index.html': 'index.html', 'camera/install.sh': 'install.sh', 'camera/uninstall.sh': 'uninstall.sh',
 };
-if (fs.existsSync(path.join(root, 'camera/wifi.conf'))) files['camera/wifi.conf'] = 'wifi.conf'; // optional, holds a password
+if (rendered || fs.existsSync(path.join(root, 'camera/wifi.conf'))) files['camera/wifi.conf'] = 'wifi.conf'; // optional, holds a password
 // HTTPS key + self-signed certificate (EC P-256), generated once per camera into the
 // git-ignored camera/tls/ with openssl (Git for Windows ships one). Only pushed when present.
 const tlsDir = path.join(root, 'camera/tls');
@@ -55,7 +57,8 @@ if (!fs.existsSync(path.join(tlsDir, 'key.der'))) {
 if (fs.existsSync(path.join(tlsDir, 'key.der'))) { files['camera/tls/key.der'] = 'key.der'; files['camera/tls/cert.der'] = 'cert.der'; }
 for (const [src, dst] of Object.entries(files)) {
   // Shell scripts must have LF line endings on the camera.
-  const buf = fs.readFileSync(path.join(root, src));
+  const generated=rendered && ['mjpg.conf','wifi.conf'].includes(dst) ? path.join(rendered,dst) : null;
+  const buf = fs.readFileSync(generated || path.join(root, src));
   fs.writeFileSync(path.join(stage, dst), /\.(sh|conf|html)$/.test(dst) ? buf.toString().replace(/\r\n/g, '\n') : buf);
 }
 

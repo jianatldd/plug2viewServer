@@ -5,11 +5,10 @@ const path = require('path'), http = require('http'), assert = require('assert/s
 const {spawnSync} = require('child_process');
 const root = path.resolve(__dirname, '..'), camera = require('./config').cameraAddress(process.argv.slice(2));
 const {chromium} = require(path.join(root, '.build/browser/node_modules/playwright-core'));
-const origin = `http://${camera}:8080`;
+const origin = `http://${camera}:${require('./config').servicePort('PORT')}`;
 const sh = spawnSync(process.execPath, [path.join(__dirname, 'camera-shell.js'), '--camera', camera, '-c', 'cat /mnt/sif/owrt/mjpg.conf'], {encoding:'utf8', timeout:20000});
 if (sh.status) throw new Error('Cannot read viewer configuration');
-const match = sh.stdout.replace(/\r/g, '').match(/^CREDENTIALS=(?:"([^"\n]*)"|'([^'\n]*)'|([^\s#\n]*))$/m);
-const credentials = match && (match[1] || match[2] || match[3]);
+const credentials = require('./config').parseConf(sh.stdout).CREDENTIALS;
 if (!credentials || !credentials.includes(':')) throw new Error('Viewer credentials required');
 function request(headers, data = '{"action":"end","session":"wrong"}', method = 'POST') {
   return new Promise((resolve, reject) => {

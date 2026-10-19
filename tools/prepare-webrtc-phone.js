@@ -5,7 +5,7 @@
 const fs=require('fs'),path=require('path'),https=require('https'),crypto=require('crypto'),os=require('os');
 const {spawn,spawnSync}=require('child_process');
 const root=path.resolve(__dirname,'..'), camera=require('./config').cameraAddress(process.argv.slice(2));
-const cfg=Object.fromEntries(fs.readFileSync(path.join(root,'camera/google.conf'),'utf8').split(/\r?\n/).filter(s=>s&&!s.startsWith('#')).map(s=>{const i=s.indexOf('=');return[s.slice(0,i),s.slice(i+1)];}));
+const cfg=require('./config').googleConfig();
 const origin=new URL(cfg.PUBLIC_ORIGIN);
 function shell(command) {
  const r=spawnSync(process.execPath,[path.join(__dirname,'camera-shell.js'),'--camera',camera,'-c',command],{encoding:'utf8',timeout:30000});
@@ -16,15 +16,14 @@ function request(url,authorization,body) {
   const data=body===undefined?undefined:JSON.stringify(body),headers={host:origin.host};
   if(authorization)headers.authorization=authorization;
   if(data){headers['content-type']='application/json';headers['content-length']=Buffer.byteLength(data);}
-  const req=https.request({host:camera,port:8443,servername:origin.hostname,path:url,method:data?'POST':'GET',headers,agent:false},res=>{
+  const req=https.request({host:camera,port:require('./config').servicePort('TLS_PORT'),servername:origin.hostname,path:url,method:data?'POST':'GET',headers,agent:false},res=>{
    const chunks=[];res.on('data',d=>chunks.push(d));res.on('end',()=>resolve({status:res.statusCode,data:Buffer.concat(chunks)}));res.on('aborted',()=>reject(new Error('Truncated response')));
   });req.setTimeout(15000,()=>req.destroy(new Error('Camera HTTPS timeout')));req.on('error',reject);req.end(data);
  });
 }
 (async()=>{
  const config=shell('cat /mnt/sif/owrt/mjpg.conf');
- const match=config.match(/^CREDENTIALS=(?:"([^"\n]*)"|'([^'\n]*)'|([^\s#\n]*))$/m);
- const credentials=match&&(match[1]||match[2]||match[3]);
+ const credentials=require('./config').parseConf(config).CREDENTIALS;
  if(!credentials||!credentials.includes(':'))throw new Error('Existing viewer Basic authentication is required');
  if((await request('/webrtc-check.html')).status!==401)throw new Error('Viewer must reject unauthenticated access');
  const generation=(shell('cat /mnt/sif/owrt/google.conf.state').match(/^([a-f0-9]{64})$/m)||[])[1];

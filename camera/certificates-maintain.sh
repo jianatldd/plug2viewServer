@@ -10,9 +10,14 @@ D=$B/certificates
 U=$D/cert-util
 MODE=${1:-check}
 LOCK=/tmp/plug2view-cert-lock
+[ ! -f "$B/maintenance.conf" ] || . "$B/maintenance.conf"
+DDNS_ENABLED=${DDNS_ENABLED:-1}; LE_ENABLED=${LE_ENABLED:-1}
+DDNS_INTERVAL=${DDNS_INTERVAL:-300}; LE_INTERVAL=${LE_INTERVAL:-86400}
+LE_RETRY=${LE_RETRY:-3600}; LE_RENEW_DAYS=${LE_RENEW_DAYS:-30}
+case "$MODE" in check|issue|staging|activate) ;; *) exit 1;; esac
+if [ "$MODE" = check ] && [ "$DDNS_ENABLED" != 1 ] && [ "$LE_ENABLED" != 1 ]; then exit 0; fi
 [ -x "$U" ] && [ -f "$B/duckdns.conf" ] || exit 0
 [ "$(date +%Y)" -ge 2026 ] || exit 0
-case "$MODE" in check|issue|staging|activate) ;; *) exit 1;; esac
 if [ -d "$LOCK" ] && [ ! -s "$LOCK/pid" ] && "$U" due "$LOCK" 120; then "$U" rmdir "$LOCK" 2>/dev/null || true; fi
 if ! mkdir "$LOCK" 2>/dev/null; then
     [ -s "$LOCK/pid" ] || exit 0
@@ -31,12 +36,12 @@ if [ "$MODE" = check ]; then
     exec >> "$LOG" 2>&1
 fi
 NOW=$(date +%s)
-if [ "$MODE" != activate ] && "$U" due /tmp/plug2view-ddns.last 300; then
+if [ "$DDNS_ENABLED" = 1 ] && [ "$MODE" != activate ] && "$U" due /tmp/plug2view-ddns.last "$DDNS_INTERVAL"; then
     if "$U" run 60 "$U" ddns; then echo "$NOW" > /tmp/plug2view-ddns.last; else echo 'DuckDNS update failed; keeping previous IP'; exit 1; fi
 fi
-[ "$MODE" != check ] || [ -f "$D/enabled" ] || exit 0
-if [ "$MODE" = check ] && ! "$U" due /tmp/plug2view-cert.last 86400; then exit 0; fi
-if [ "$MODE" = check ] && ! "$U" due /tmp/plug2view-cert.attempt 3600; then exit 0; fi
+[ "$MODE" != check ] || { [ "$LE_ENABLED" = 1 ] && [ -f "$D/enabled" ]; } || exit 0
+if [ "$MODE" = check ] && ! "$U" due /tmp/plug2view-cert.last "$LE_INTERVAL"; then exit 0; fi
+if [ "$MODE" = check ] && ! "$U" due /tmp/plug2view-cert.attempt "$LE_RETRY"; then exit 0; fi
 HOST=$("$U" hostname)
 export UACME_CAINFO=$D/ca.pem
 CONF=$D/acme
@@ -51,7 +56,7 @@ if [ "$MODE" != activate ]; then
         touch "$CONF/account-ready"
     fi
     RC=0
-    "$U" run 600 "$D/uacme" $STAGING -t EC -b 256 -d 30 -c "$CONF" -h "$U" issue "$HOST" || RC=$?
+    "$U" run 600 "$D/uacme" $STAGING -t EC -b 256 -d "$LE_RENEW_DAYS" -c "$CONF" -h "$U" issue "$HOST" || RC=$?
     [ "$RC" -le 1 ] || { echo 'Certificate renewal failed; keeping current certificate'; exit 1; }
     if [ "$MODE" = staging ]; then echo 'Staging DNS-01 check passed; certificate not installed'; exit 0; fi
     [ -f "$D/enabled" ] || { echo "$NOW" > /tmp/plug2view-cert.last; echo 'Production certificate ready; awaiting hostname migration'; exit 0; }

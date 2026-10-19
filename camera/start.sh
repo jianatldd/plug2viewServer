@@ -8,6 +8,8 @@ BASE=/mnt/sif/owrt
 LOG=/tmp/camd.log
 
 [ -f $BASE/mjpg.conf ] && . $BASE/mjpg.conf
+[ ! -f $BASE/maintenance.conf ] || . $BASE/maintenance.conf
+DDNS_ENABLED=${DDNS_ENABLED:-1}; LE_ENABLED=${LE_ENABLED:-1}
 RES=${RES:-1280x720}; FPS=${FPS:-15}; PORT=${PORT:-8080}; DEVICE=${DEVICE:-/dev/video0}; PLFREQ=${PLFREQ:-60}
 export TZ=${TZ:-EST5EDT,M3.2.0,M11.1.0}      # local time for file names (POSIX TZ string)
 
@@ -21,14 +23,13 @@ stop() {
 }
 
 start() {
-    AUTH=""
-    [ -n "$CREDENTIALS" ] && AUTH="-c $CREDENTIALS"
-    GOOGLE=""
-    [ -f $BASE/google.conf ] && GOOGLE="-g $BASE/google.conf"
     TLS_DIR=$BASE/tls
     [ -s $BASE/tls/managed/cert.der ] && [ -s $BASE/tls/managed/key.der ] && TLS_DIR=$BASE/tls/managed
+    set -- -d "${H264_DEVICE:-/dev/video1}" -j "$DEVICE" -p "$PORT" -l "$PLFREQ" -a "${CTL_PORT:-8081}" -w "$BASE/www" -s "${SAVE_DIR:-/media/sda1/plug2view}" -t "${TLS_PORT:-8443}" -C "${TLS_CERT:-$TLS_DIR/cert.der}" -K "${TLS_KEY:-$TLS_DIR/key.der}"
+    [ -z "$CREDENTIALS" ] || set -- "$@" -c "$CREDENTIALS"
+    if [ "${GOOGLE_ENABLED:-1}" = 1 ] && [ -f $BASE/google.conf ]; then set -- "$@" -g "$BASE/google.conf"; fi
     pgrep camd >/dev/null || \
-        $BASE/bin/hkctl daemon $LOG $BASE/bin/camd -d ${H264_DEVICE:-/dev/video1} -j $DEVICE -p $PORT -l $PLFREQ -a ${CTL_PORT:-8081} -w $BASE/www -s ${SAVE_DIR:-/media/sda1/plug2view} -t ${TLS_PORT:-8443} -C $TLS_DIR/cert.der -K $TLS_DIR/key.der $AUTH $GOOGLE
+        $BASE/bin/hkctl daemon "$LOG" $BASE/bin/camd "$@"
     pgrep -f 'hkctl serve' >/dev/null || \
         $BASE/bin/hkctl daemon /tmp/hkctl.log $BASE/bin/hkctl serve ${CTL_PORT:-8081}
     # Motion detector (polls the Sonix hardware detector; saves frames to the SD card).
@@ -40,8 +41,10 @@ start() {
     mkdir -p /tmp/hk-watch
     echo 'pgrep camd >/dev/null && pgrep -f "hkctl serve" >/dev/null && pgrep -f "hkctl motion" >/dev/null || /mnt/sif/owrt/start.sh' > /tmp/hk-watch/mjpg
     echo 'sh /mnt/sif/owrt/sd.sh check >>/tmp/sd.log 2>&1' > /tmp/hk-watch/sd
-    if [ -f $BASE/duckdns.conf ] && [ -f $BASE/certificates/maintain.sh ]; then
+    if { [ "$DDNS_ENABLED" = 1 ] || [ "$LE_ENABLED" = 1 ]; } && [ -f $BASE/duckdns.conf ] && [ -f $BASE/certificates/maintain.sh ]; then
         echo '/mnt/sif/owrt/bin/hkctl daemon /dev/null /bin/sh /mnt/sif/owrt/certificates/maintain.sh' > /tmp/hk-watch/certificates
+    else
+        rm -f /tmp/hk-watch/certificates
     fi
 }
 

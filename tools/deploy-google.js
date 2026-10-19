@@ -7,7 +7,7 @@ const {spawn, spawnSync} = require('child_process');
 const args = process.argv.slice(2), root = path.resolve(__dirname, '..');
 const opt = n => { const i = args.indexOf(n); return i < 0 ? null : args[i + 1]; };
 const camera = require('./config').cameraAddress(args);
-const pc = opt('--pc') || Object.values(os.networkInterfaces()).flat().find(a => a.family === 'IPv4' && !a.internal && a.address.startsWith(camera.split('.').slice(0, 3).join('.') + '.'))?.address;
+const pc = opt('--pc') || require('./config').readLocal().pc || Object.values(os.networkInterfaces()).flat().find(a => a.family === 'IPv4' && !a.internal && a.address.startsWith(camera.split('.').slice(0, 3).join('.') + '.'))?.address;
 if (!pc) throw new Error('Pass --pc with this computer’s LAN IP');
 const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'plug2view-google-'));
 const base = '/mnt/sif/owrt';

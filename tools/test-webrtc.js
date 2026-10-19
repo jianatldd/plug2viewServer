@@ -7,7 +7,7 @@ const fs=require('fs'),path=require('path'),https=require('https'),crypto=requir
 const {spawnSync}=require('child_process');
 const root=path.resolve(__dirname,'..'),camera=require('./config').cameraAddress(process.argv.slice(2));
 const {chromium}=require(path.join(root,'.build/browser/node_modules/playwright-core'));
-const cfg=Object.fromEntries(fs.readFileSync(path.join(root,'camera/google.conf'),'utf8').split(/\r?\n/).filter(s=>s&&!s.startsWith('#')).map(s=>{let i=s.indexOf('=');return[s.slice(0,i),s.slice(i+1)]}));
+const cfg=require('./config').googleConfig();
 const origin=new URL(cfg.PUBLIC_ORIGIN);
 const badFingerprint=process.argv.includes('--bad-fingerprint');
 const receiverOffer=process.argv.includes('--receiver-offer');
@@ -25,7 +25,7 @@ function request(url,body,token,method='POST') {
     const headers={host:origin.host,'content-type':'application/json'};
     if(token) headers.authorization='Bearer '+token;
     if(data) headers['content-length']=Buffer.byteLength(data);
-    const req=https.request({host:camera,port:8443,servername:origin.hostname,path:url,method,headers,agent:false},res=>{
+    const req=https.request({host:camera,port:require('./config').servicePort('TLS_PORT'),servername:origin.hostname,path:url,method,headers,agent:false},res=>{
       responseStatus=res.statusCode;
       let text='';res.on('data',b=>{responseBytes+=b.length;text+=b;});res.on('end',()=>{try{resolve({status:res.statusCode,headers:res.headers,json:JSON.parse(text)});}catch(e){reject(new Error('Invalid JSON response from '+url));}});
       res.on('aborted',()=>reject(new Error('Truncated HTTPS response from '+url)));

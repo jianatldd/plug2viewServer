@@ -7,7 +7,7 @@
 const fs=require('fs'),path=require('path'),https=require('https'),crypto=require('crypto'),assert=require('assert/strict');
 const {spawnSync}=require('child_process');
 const camera=require('./config').cameraAddress(process.argv.slice(2));
-const cfg=Object.fromEntries(fs.readFileSync('camera/google.conf','utf8').split(/\r?\n/).filter(s=>s&&!s.startsWith('#')).map(s=>{const i=s.indexOf('=');return[s.slice(0,i),s.slice(i+1)];}));
+const cfg=require('./config').googleConfig();
 const origin=new URL(cfg.PUBLIC_ORIGIN);
 function shell(command) {
  const r=spawnSync(process.execPath,[path.join(__dirname,'camera-shell.js'),'--camera',camera,'-c',command],{encoding:'utf8',timeout:20000});
@@ -17,13 +17,13 @@ const generation=(shell('cat /mnt/sif/owrt/google.conf.state').match(/^([a-f0-9]
 assert.ok(generation);
 const expiry=Math.floor(Date.now()/1000)+600;
 const access=`a.${expiry}.`+crypto.createHmac('sha256',cfg.TOKEN_KEY).update(`a.${expiry}.${generation}`).digest('hex');
-const m=shell('cat /mnt/sif/owrt/mjpg.conf').match(/^CREDENTIALS=(?:"([^"\n]*)"|'([^'\n]*)'|([^\s#\n]*))$/m);
-assert.ok(m);const basic='Basic '+Buffer.from(m[1]||m[2]||m[3]).toString('base64');
+const credentials=require('./config').parseConf(shell('cat /mnt/sif/owrt/mjpg.conf')).CREDENTIALS;
+assert.ok(credentials);const basic='Basic '+Buffer.from(credentials).toString('base64');
 function request(url,body,authorization=basic) {
  const data=body===undefined?undefined:JSON.stringify(body);
  return new Promise((resolve,reject)=>{
   const headers={host:origin.host,authorization};if(data){headers['content-type']='application/json';headers['content-length']=Buffer.byteLength(data);}
-  const req=https.request({host:camera,port:8443,servername:origin.hostname,path:url,method:data?'POST':'GET',headers,agent:false},res=>{
+  const req=https.request({host:camera,port:require('./config').servicePort('TLS_PORT'),servername:origin.hostname,path:url,method:data?'POST':'GET',headers,agent:false},res=>{
    const chunks=[];res.on('data',b=>chunks.push(b));res.on('end',()=>{
     const bytes=Buffer.concat(chunks);let json;
     try{if(res.headers['content-type']?.includes('json'))json=JSON.parse(bytes);}catch(e){reject(new Error('Invalid JSON at '+url));return;}

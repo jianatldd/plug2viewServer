@@ -10,14 +10,14 @@ if (!opt('--config')) throw new Error('Pass --config with the deployed throwaway
 const cfg = Object.fromEntries(fs.readFileSync(opt('--config'), 'utf8').split(/\r?\n/).filter(l => l && !l.startsWith('#')).map(l => { const i = l.indexOf('='); return [l.slice(0, i), l.slice(i + 1)]; }));
 const shell = spawnSync(process.execPath, [path.join(__dirname, 'camera-shell.js'), '--camera', camera, '--timeout', '10000', '-c', 'cat /mnt/sif/owrt/mjpg.conf'], {encoding: 'utf8', timeout: 15000});
 if (shell.status) throw new Error('Cannot read camera test credentials');
-const credentials = shell.stdout.match(/^CREDENTIALS=(.*)$/m)?.[1]?.trim();
+const credentials = require('./config').parseConf(shell.stdout.replace(/\r/g, '')).CREDENTIALS;
 if (!credentials) throw new Error('Tests require camera Basic authentication to be enabled');
 const basic = 'Basic ' + Buffer.from(credentials).toString('base64');
 function request(route, {method = 'GET', data, headers = {}, tls = true} = {}) {
   const body = data === undefined ? undefined : typeof data === 'string' ? data : JSON.stringify(data);
   if (body !== undefined) { headers['content-length'] = Buffer.byteLength(body); headers['content-type'] ||= 'application/json'; }
   return new Promise((resolve, reject) => {
-    const q = (tls ? https : http).request({host: camera, port: tls ? 8443 : 8080, path: route, method, headers, rejectUnauthorized: false, agent: false}, res => {
+    const q = (tls ? https : http).request({host: camera, port: require('./config').servicePort(tls ? 'TLS_PORT' : 'PORT'), path: route, method, headers, rejectUnauthorized: false, agent: false}, res => {
       const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => resolve({status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks), text: Buffer.concat(chunks).toString()}));
     });
     q.setTimeout(25000, () => q.destroy(new Error('Camera request timeout'))); q.on('error', reject); q.end(body);

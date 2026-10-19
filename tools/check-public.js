@@ -22,11 +22,16 @@ for(const file of ['camera/google.conf','camera/duckdns.conf','camera/wifi.conf'
     if(m[1]==='CREDENTIALS'&&value) add('encoded website credentials',Buffer.from(value).toString('base64'));
   }
 }
-function localValues(obj,prefix) {
+const configDefaults=require('./configuration').defaults;
+function localValues(obj,prefix,defaults=configDefaults) {
   for(const [key,value]of Object.entries(obj)) {
     if(key.startsWith('_'))continue;
-    if(value&&typeof value==='object')localValues(value,prefix+'.'+key);
-    else add(prefix+'.'+key,value);
+    if(value&&typeof value==='object')localValues(value,prefix+'.'+key,defaults?.[key]);
+    else if(value!==defaults?.[key] && /^(?:camera|pc|username|password|CLIENT_SECRET|LOGIN_PASSWORD|TOKEN_KEY|HOSTNAME|TOKEN|SSID|PASS|CREDENTIALS|PUBLIC_ORIGIN)$/.test(key)) {
+      add(prefix+'.'+key,value);
+      if(key==='PUBLIC_ORIGIN')try{add('configured public hostname',new URL(value).hostname);}catch{}
+      if(key==='CREDENTIALS'&&value)add('encoded website credentials',Buffer.from(value).toString('base64'));
+    }
   }
 }
 if(fs.existsSync('config.local.json')) localValues(JSON.parse(fs.readFileSync('config.local.json','utf8')),'config.local.json');
