@@ -9,8 +9,9 @@
 struct google_response { int code; const char *type; char extra[GOOGLE_RESPONSE_EXTRA]; char body[12288]; };
 int google_init(const char *config);
 int google_enabled(void);
-enum google_control_kind { GOOGLE_MOTION, GOOGLE_RECORDING, GOOGLE_PRESET };
-/* value -1 queries; other values set a switch or activate preset 0..10.
+enum google_control_kind { GOOGLE_MOTION, GOOGLE_RECORDING, GOOGLE_PRESET, GOOGLE_MOVE };
+/* value -1 queries; other values set a toggle or activate preset 0..10.
+ * GOOGLE_MOVE: 0 center, 1 left, 2 right, 3 up, 4 down (120-step jogs).
  * Return NULL on success, otherwise a Google device error code. */
 typedef const char *(*google_control_fn)(enum google_control_kind kind,int value,int *state);
 void google_set_controls(google_control_fn callback);

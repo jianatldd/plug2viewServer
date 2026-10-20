@@ -482,7 +482,8 @@ two exact Google callback URLs for the configured project. Chromium also checks
 the redirect after form submission, so restricting `form-action` to `'self'`
 alone prevents successful linking.
 
-Public API supports one camera, two control switches, and eleven momentary preset switches.
+Public API advertises one camera with recording/motion toggle actions and five
+direction settings. Legacy switch/scene IDs remain accepted for cached commands.
 QUERY/EXECUTE accept bounded batches of up to 16 device targets; each execution
 group can contain up to four commands, with at most one stream request per batch.
 It does not implement Google video history, notifications, directional controls
@@ -492,55 +493,77 @@ Matter pairing or certification for public distribution.
 ## Motion, recording, and position controls
 
 After installing, say **“Hey Google, sync my devices.”** No relinking is needed.
-The integration advertises these devices in addition to the camera:
+The integration advertises a single **Plug2View Camera** (nickname **Camera**).
+Recording and motion detection use Google's
+[Toggles trait](https://developers.home.google.com/cloud-to-cloud/traits/toggles);
+position uses the
+[Modes trait](https://developers.home.google.com/cloud-to-cloud/traits/modes).
+All controls belong to this camera, rather than separate switch tiles.
 
-| Device/action | Behavior | Example command |
+| Camera action | Behavior | Example command to try |
 | --- | --- | --- |
-| Plug2View Motion Detection | Arms/disarms motion-triggered SD recordings; preserves sensitivity/zones | “Turn on Plug2View Motion Detection” |
-| Plug2View Recording | Starts manual SD recording for up to five minutes, or stops it early | “Turn on Plug2View Recording” |
-| Plug2View Left 1–3 | Three fixed views left of Original | “Turn on Plug2View Left 1” |
-| Plug2View Right 1–3 | Three fixed views right of Original | “Turn on Plug2View Right 2” |
-| Plug2View Up 1–3 | Three fixed views above Original | “Turn on Plug2View Up 3” |
-| Plug2View Down 1 | Safe lower position | “Turn on Plug2View Down 1” |
-| Plug2View Original | Return to the saved default view | “Turn on Plug2View Original” |
+| Motion detection | Arms/disarms motion-triggered SD recordings; preserves sensitivity/zones | “Turn on motion detection for Camera” |
+| Recording | Starts manual SD recording for up to five minutes, or stops it early | “Turn on recording for Camera” |
+| Direction: Left | Pan left 120 steps from the current position | “Set Camera position to left” |
+| Direction: Right | Pan right 120 steps from the current position | “Set Camera position to right” |
+| Direction: Up | Tilt up 120 steps from the current position | “Set Camera position to up” |
+| Direction: Down | Tilt down 120 steps from the current position | “Set Camera position to down” |
+| Position: Center | Return to the saved default view; also named Centre, Original, Home | “Set Camera position to center” |
 
-All thirteen controls use separate Switch/OnOff devices. Presets act as momentary
-switches: On starts a fixed-position move and immediately returns `on:false` in
-the command response; queries also return off. Off does nothing (it neither stops
-nor reverses the motor). This reset describes the trigger, not movement completion.
-They appear as separate switch tiles and on/off automation actions after sync,
-rather than directional buttons inside Google's camera viewer. Testing confirmed
-they work, though the interface was cumbersome to use. Grouping controls with Modes and
-Toggles remains an unimplemented follow-up experiment.
+Google controls voice grammar and which controls each app surface displays.
+These traits do not add directional buttons to Google's camera viewer. For exact
+phrases, create voice routines with these starters and corresponding camera actions:
 
-Earlier firmware advertised the eleven presets as scenes. Only the camera and
-two persistent switches were visible during testing; the scenes were absent from
-automation actions. Presets now retain their IDs but advertise Switch/OnOff.
-Cached ActivateScene requests remain accepted during the transition. Sync devices
-after upgrading; no account unlink is required by the firmware.
+| Voice starter | Camera action |
+| --- | --- |
+| “Turn on camera recording” | Recording on |
+| “Turn off camera recording” | Recording off |
+| “Camera look left” | Position Left (`left`) |
+| “Camera look right” | Position Right (`right`) |
+| “Camera center” | Position Center (`center`) |
+
+If the app does not expose a trait in its action picker, use a custom Assistant
+action containing the corresponding “Set Camera position…” or recording command.
+Voice recognition, routine availability, and app presentation require Google Home
+testing after deployment; protocol tests alone do not establish them.
+
+The position mode is command-only: success acknowledges starting a move, without
+claiming the head has arrived or reporting a stale position after a browser move.
+QUERY and successful control responses return `currentToggleSettings` with
+`recording` and `motion_detection`. EXECUTE accepts `SetToggles` with
+`updateToggleSettings`, and `SetModes` with `updateModeSettings.position`.
+The five direction values are `center`, `left`, `right`, `up`, and `down`.
+Every direction command is a new relative move, matching one website arrow press.
+Repeated commands continue moving; they do not select a fixed view. Center alone
+returns to the saved default view.
+
+Earlier firmware advertised thirteen switches (and, previously, preset scenes).
+They are no longer advertised. Cached OnOff and ActivateScene commands remain
+accepted during migration; preset Off still does nothing. Existing routines using
+separate switches should be recreated against the camera after syncing devices.
+No account unlink is required by the firmware.
 No camera power or day/night control is advertised.
 
-All fixed positions use the existing saved `park.pos` as their origin. Left,
-right, and up divide the remaining safe travel into three equal intervals, with
-the other axis at its original coordinate. Down uses the lower software limit.
-For the current saved origin `(2020,58)`, the targets are left x=1420/820/220,
-right x=2620/3220/3820, up y=391/724/1057, down y=20. Original is `(2020,58)`.
-The existing viewer's saved default view remains authoritative; these are not
-relative jogs and repeating a command does not continue moving the camera.
+Directions use the same 120-step increments as the website: Left/Right change
+pan by -120/+120; Up/Down change tilt by +120/-120. The other axis stays in place.
+Moves clamp to the existing software limits, x=220..3820 and y=20..1057. Center
+uses the existing saved `park.pos`; the viewer's saved default remains authoritative.
+The helper resolves each relative target from the latest position while holding
+the shared motor lock, so a previous website move is taken into account.
 The motor runs in a separate process under the same lock as the viewer. An
 activation acknowledges starting the move; it does not claim that movement has
-finished. A different preset during a move returns `deviceBusy`.
-Avoid including several preset switches in a group-wide On command; each selects
-a different camera position, so conflicting moves can return `deviceBusy`.
+finished. Any new direction command during an active move returns `deviceBusy`.
+Avoid requesting multiple positions in one automation; conflicting moves can
+return `deviceBusy`.
 
-The Recording switch controls manual recording independently of motion arming.
+The Recording toggle controls manual recording independently of motion arming.
 Repeated starts preserve the current file; a manual start can take over an active
 motion clip. Motion-event stops cannot terminate a manual recording. Switching
 manual recording off does not disarm future motion clips. Manual recording now
 automatically stops and finalizes its MP4 five minutes after the first manual On
 command. Repeated On commands do not extend that deadline. The timer uses the
 monotonic clock, so NTP corrections cannot extend the recording. QUERY then
-reports the recording switch Off. The status endpoint includes
+reports the recording toggle Off. The status endpoint includes
 `manual_recording`, `recording_limit_seconds`, and `recording_remaining_seconds`.
 Recording stops on
 restart and retains the existing recorder sample-limit/capture-idle safeguards.
@@ -557,7 +580,7 @@ settling interval also clears the five-second recording pre-roll. Explicit manua
 recordings continue during movement. `/api/motion` exposes `state.suppressed`;
 the saved motion arming/sensitivity/zone settings remain unchanged.
 
-Validation: isolated on-device tests cover all 14 advertised devices, batched
+Historical switch-firmware validation: isolated on-device tests covered all 14 advertised devices, batched
 queries/commands, invalid/offline/unknown requests, all preset mappings, safe
 travel bounds, and the original streaming response. Live tests exercised both
 switches, verified preserved motion settings and recording ownership, then moved
@@ -574,12 +597,19 @@ thirteen switches. Right 1 and Original reached the exact targets, off did not
 move the motor, and capture stayed live during nine position polls. Google Home
 tile discovery and operation were subsequently confirmed in testing.
 
+The current isolated regression checks one advertised camera, recording/motion
+toggles, Center and all four relative jogs, repeated moves, travel bounds,
+invalid/offline/busy requests, cached legacy commands, and the stream response.
+Its complete SYNC JSON is also parsed and checked separately on the host.
+This does not establish Google Home voice or UI behavior.
+
 `tools/test-google-controls.js` is read-only apart from temporary OAuth-token
 generation in memory. Add `--exercise` to briefly enable motion, record a clip,
-and test Right 1/Original; it refuses to interrupt an existing recording and
+and test relative movement/Center; it refuses to interrupt an existing recording and
 restores the initial switch states. It never links, unlinks, or rotates tokens.
-Use `--presets-only` to test movement and momentary switch behavior without
-changing motion or recording settings; it finishes at the saved Original view.
+Use `--movement-only` (`--presets-only` is a compatibility alias) to test the
+camera's direction actions without changing motion or recording settings; it
+finishes at the saved Center view.
 Use `--recording-policy` for a short pan/return suppression test and a real
 five-minute manual recording timeout; it restores the initial position and motion
 arming setting. `tools/test-recording-policy.c` runs isolated lifecycle tests with

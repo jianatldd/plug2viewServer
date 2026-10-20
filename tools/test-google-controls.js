@@ -1,7 +1,7 @@
 // Live control verification. Does not link/unlink or revoke OAuth tokens.
-// --exercise briefly enables motion, records a clip, moves to Right 1, then
-// Original. Refuses to interrupt an existing recording; restores switch state.
-// --presets-only checks momentary preset switches without changing recording/motion.
+// --exercise briefly enables motion, records a clip, tests relative moves, then
+// Center. Refuses to interrupt an existing recording; restores toggle state.
+// --movement-only checks direction actions without changing recording/motion.
 // --recording-policy checks movement suppression and a real five-minute timeout.
 'use strict';
 const fs=require('fs'),path=require('path'),https=require('https'),crypto=require('crypto'),assert=require('assert/strict');
@@ -37,46 +37,54 @@ async function intent(name,payload) {
  assert.equal(r.status,200);return r.json.payload;
 }
 const switchCommand=(id,on)=>({devices:[{id}],execution:[{command:'action.devices.commands.OnOff',params:{on}}]});
-async function setSwitch(id,on){const r=await intent('EXECUTE',{commands:[switchCommand(id,on)]});assert.equal(r.commands[0].status,'SUCCESS');assert.equal(r.commands[0].states.on,on);}
+const toggleName=id=>id==='plug2view-motion'?'motion_detection':'recording';
+const toggleCommand=(settings)=>({devices:[{id:'plug2view'}],execution:[{command:'action.devices.commands.SetToggles',params:{updateToggleSettings:settings}}]});
+const positionCommand=position=>({devices:[{id:'plug2view'}],execution:[{command:'action.devices.commands.SetModes',params:{updateModeSettings:{position}}}]});
+async function setSwitch(id,on){const key=toggleName(id);const r=await intent('EXECUTE',{commands:[toggleCommand({[key]:on})]});assert.equal(r.commands[0].status,'SUCCESS');assert.equal(r.commands[0].states.currentToggleSettings[key],on);}
 async function query(ids){return(await intent('QUERY',{devices:ids.map(id=>({id}))})).devices;}
-async function preset(id,on=true){const t=Date.now();const r=await intent('EXECUTE',{commands:[switchCommand(id,on)]});assert.equal(r.commands[0].status,'SUCCESS');assert.equal(r.commands[0].states.on,false);assert.ok(Date.now()-t<1500,'Motor activation must not block video capture');}
+async function recordingState(){return(await query(['plug2view'])).plug2view.currentToggleSettings.recording;}
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function waitFor(check,label) {for(let i=0;i<45;i++){if(await check())return;await delay(400);}throw new Error('Timed out waiting for '+label);}
-async function testPresets() {
+async function testMovement() {
  const park=(shell('cat /mnt/sif/owrt/park.pos').match(/^(\d+) (\d+)$/m)||[]).slice(1).map(Number);assert.equal(park.length,2);
- const initial=(await request('/api/status')).json;
- await preset('plug2view-right-1',false);await delay(500);
- const afterOff=(await request('/api/status')).json;assert.equal(afterOff.x,initial.x);assert.equal(afterOff.y,initial.y);
- const right=park[0]+Math.floor((3820-park[0])/3);let polls=0,moved=false;
+ let polls=0,moved=false;
+ const step=async(direction,dx,dy)=>{
+  const before=(await request('/api/status')).json;assert.equal(before.known,true);
+  const tx=Math.max(220,Math.min(3820,before.x+dx)),ty=Math.max(20,Math.min(1057,before.y+dy));
+  await waitFor(async()=>{const started=Date.now();const r=await intent('EXECUTE',{commands:[positionCommand(direction)]});assert.ok(Date.now()-started<1500,'Motor activation must not block video capture');if(r.commands[0].errorCode==='deviceBusy')return false;assert.equal(r.commands[0].status,'SUCCESS');assert.equal(r.commands[0].states.currentModeSettings,undefined);return true;},direction+' activation');
+  moved=true;
+  await waitFor(async()=>{const status=(await request('/?action=status')).json;assert.ok(status.frame_age_ms<3000,'Capture must continue during motor movement');polls++;const pos=(await request('/api/status')).json;return pos.x===tx&&pos.y===ty;},direction);
+ };
  try {
-  await preset('plug2view-right-1');moved=true;
-  assert.equal((await query(['plug2view-right-1']))['plug2view-right-1'].on,false);
-  await waitFor(async()=>{const status=(await request('/?action=status')).json;assert.ok(status.frame_age_ms<3000,'Capture must continue during motor movement');polls++;const pos=(await request('/api/status')).json;return pos.x===right&&pos.y===park[1];},'Right 1');
+  await step('right',120,0);await step('right',120,0);
+  await step('left',-120,0);await step('up',0,120);await step('down',0,-120);
  } finally {
   if(moved) {
-   await waitFor(async()=>{const r=await intent('EXECUTE',{commands:[switchCommand('plug2view-original',true)]});if(r.commands[0].errorCode==='deviceBusy')return false;assert.equal(r.commands[0].status,'SUCCESS');assert.equal(r.commands[0].states.on,false);return true;},'Original activation');
+   await waitFor(async()=>{const r=await intent('EXECUTE',{commands:[positionCommand('center')]});if(r.commands[0].errorCode==='deviceBusy')return false;assert.equal(r.commands[0].status,'SUCCESS');return true;},'Center activation');
    await waitFor(async()=>{const pos=(await request('/api/status')).json;return pos.x===park[0]&&pos.y===park[1];},'Original');
   }
  }
- console.log('PASS: preset Off does not move; On resets to off; Right 1 and Original reach exact targets; capture stayed live during '+polls+' position polls');
+ console.log('PASS: repeated Right, Left, Up, Down match website 120-step moves; Center returns to saved view; capture stayed live during '+polls+' position polls');
 }
 (async()=>{
- const sync=await intent('SYNC');assert.equal(sync.devices.length,14);
- assert.equal(sync.devices[0].id,'plug2view');assert.deepEqual(sync.devices[0].traits,['action.devices.traits.CameraStream']);
- assert.equal(sync.devices.filter(d=>d.type.endsWith('.SWITCH')).length,13);assert.equal(sync.devices.filter(d=>d.type.endsWith('.SCENE')).length,0);
- for(const d of sync.devices.slice(1))assert.deepEqual(d.traits,['action.devices.traits.OnOff']);
+ const sync=await intent('SYNC');assert.equal(sync.devices.length,1);
+ assert.equal(sync.devices[0].id,'plug2view');assert.deepEqual(sync.devices[0].traits,['action.devices.traits.CameraStream','action.devices.traits.Toggles','action.devices.traits.Modes']);
+ assert.deepEqual(sync.devices[0].attributes.availableToggles.map(t=>t.name),['recording','motion_detection']);
+ assert.equal(sync.devices[0].attributes.commandOnlyModes,true);
+ assert.deepEqual(sync.devices[0].attributes.availableModes[0].settings.map(s=>s.setting_name),['center','left','right','up','down']);
  const states=await query(sync.devices.map(d=>d.id));for(const s of Object.values(states))assert.equal(s.status,'SUCCESS');
- for(const d of sync.devices.slice(3))assert.equal(states[d.id].on,false);
- const unauthorized=await request('/google/fulfillment',{requestId:'unauthorized',inputs:[{intent:'action.devices.EXECUTE',payload:{commands:[switchCommand('plug2view-motion',true)]}}]},'Bearer wrong');assert.equal(unauthorized.status,401);
- const invalid=await intent('EXECUTE',{commands:[switchCommand('plug2view',false),switchCommand('missing',true),switchCommand('plug2view-motion','false')]});
+ for(const state of Object.values(states.plug2view.currentToggleSettings))assert.equal(typeof state,'boolean');
+ assert.equal(states.plug2view.currentModeSettings,undefined);
+ const unauthorized=await request('/google/fulfillment',{requestId:'unauthorized',inputs:[{intent:'action.devices.EXECUTE',payload:{commands:[toggleCommand({recording:true})]}}]},'Bearer wrong');assert.equal(unauthorized.status,401);
+ const invalid=await intent('EXECUTE',{commands:[switchCommand('plug2view',false),switchCommand('missing',true),toggleCommand({recording:'false'})]});
  assert.deepEqual(invalid.commands.map(c=>c.errorCode),['functionNotSupported','deviceNotFound','valueOutOfRange']);
- console.log('PASS: 14 devices, batched QUERY/EXECUTE, authentication, no camera power control, invalid commands rejected');
- if(process.argv.includes('--presets-only')){await testPresets();return;}
+ console.log('PASS: one camera with toggles and position actions, QUERY/EXECUTE, authentication, no camera power control, invalid commands rejected');
+ if(process.argv.includes('--movement-only')||process.argv.includes('--presets-only')){await testMovement();return;}
  if(process.argv.includes('--recording-policy')) {
   assert.equal((await request('/?action=status')).json.recording,false,'Refusing to interrupt an existing recording');
   const position=(await request('/api/status')).json;
   assert.equal(position.known,true);
-  const initialMotion=states['plug2view-motion'].on;
+  const initialMotion=states.plug2view.currentToggleSettings.motion_detection;
   let moved=false;
   const restore=async()=>{if(moved){await request(`/api/ptz?x=${position.x}&y=${position.y}`);moved=false;}};
   const move=async()=>{moved=true;const dx=position.x<position.range.x[1]-120?120:-120;assert.equal((await request('/api/ptz?dx='+dx)).status,200);};
@@ -120,7 +128,7 @@ async function testPresets() {
    assert.equal(s.manual_recording,false);assert.equal(s.recording,false);
    assert.equal(s.recording_remaining_seconds,0);assert.ok(s.rec_samples>3000);
    assert.ok(Date.now()-started>=299000,'Must run for the configured five minutes');
-   assert.equal((await query(['plug2view-recording']))['plug2view-recording'].on,false);
+   assert.equal(await recordingState(),false);
    console.log('PASS: real five-minute recording automatically finalized; Google QUERY reports Off');
   } finally {
    await setSwitch('plug2view-recording',false);await restore();await setSwitch('plug2view-motion',initialMotion);
@@ -129,7 +137,7 @@ async function testPresets() {
  }
  if(!process.argv.includes('--exercise'))return;
  const initial=(await request('/?action=status')).json;assert.equal(initial.recording,false,'Refusing to interrupt an existing recording');
- const motionBefore=(await request('/api/motion')).json;const initialMotion=states['plug2view-motion'].on;
+ const motionBefore=(await request('/api/motion')).json;const initialMotion=states.plug2view.currentToggleSettings.motion_detection;
  let mutated=false;
  try {
   mutated=true;await setSwitch('plug2view-recording',true);await setSwitch('plug2view-recording',true);
@@ -138,7 +146,7 @@ async function testPresets() {
   assert.equal((await request('/?action=rec&stop=1&tag=motion')).json.manual_recording,true);
   await setSwitch('plug2view-motion',true);
   await waitFor(async()=> (await request('/api/motion')).json.state.enabled,'motion enable');
-  assert.equal((await query(['plug2view-recording']))['plug2view-recording'].on,true);
+  assert.equal(await recordingState(),true);
   await setSwitch('plug2view-motion',false);
   await waitFor(async()=>!(await request('/api/motion')).json.state.enabled,'motion disable');
   const motionAfter=(await request('/api/motion')).json;
@@ -148,7 +156,7 @@ async function testPresets() {
   const clip=await request('/rec/'+started.recording);assert.equal(clip.status,200);assert.ok(clip.bytes.includes(Buffer.from('moov'))&&clip.bytes.includes(Buffer.from('mdat')));
   fs.writeFileSync('.build/google-controls-test.mp4',clip.bytes);
   console.log('PASS: motion changes apply, settings preserved, manual recording survives motion stop, MP4 finalized');
-  await testPresets();
+  await testMovement();
  } finally {
   if(mutated){await setSwitch('plug2view-recording',false);await setSwitch('plug2view-motion',initialMotion);}
  }

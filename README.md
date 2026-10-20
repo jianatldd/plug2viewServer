@@ -70,10 +70,11 @@ second. Negotiating a silent PCMU audio track resolved the app's loading screen.
 The Google Hub also plays WebRTC, with an estimated 1–2 seconds of delay. These
 are visual estimates; extended-session stability remains to be tested. HLS
 playback also works but had an estimated 4–5 second delay.
-Google Home also exposes Motion Detection and manual Recording switches, plus
-fixed Left 1–3, Right 1–3, Up 1–3, Down 1, and Original momentary switches. Say
-“sync my devices” after upgrading; turning a preset on starts the move and resets
-its switch to off. These are separate controls, outside Google's camera viewer.
+Google Home exposes one Camera device with Recording and Motion Detection
+toggle actions and direction actions: Left, Right, Up, Down, and Center.
+Say “sync my devices” after upgrading, then try “turn on recording for Camera” or
+“set Camera position to center.” For exact phrases such as “camera look left,”
+create a Google Home voice routine that sets Camera position to Left.
 Manual recording automatically stops after five minutes; repeated On commands
 do not extend it. Pan/tilt moves suppress motion-triggered recording while moving
 and for seven seconds afterward. Manual recording continues during movement.
@@ -310,8 +311,8 @@ node tools/camera-shell.js -c "cat /tmp/camd.log"
 ```
 
 The WebRTC build advertises WebRTC and HLS, preferring WebRTC when the receiver
-offers it. The integration exposes one camera, motion/recording switches, and
-eleven momentary preset switches. It does not provide Google video history,
+offers it. The integration exposes one camera with motion/recording toggles and
+four relative direction actions plus Center. It does not provide Google video history,
 notifications, directional buttons inside Google's camera viewer, two-way audio,
 Matter pairing, or public-distribution certification. See
 [the full Google Home guide](docs/google-home.md) for validation and limitations.

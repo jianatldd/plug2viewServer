@@ -136,7 +136,7 @@ static int cmd_neck(int argc, char **argv) {
     if (argc < 3) return 1;
     const char *sub = argv[2];
     int preset_lock=-1;
-    if(!strcmp(sub,"preset")) {
+    if(!strcmp(sub,"preset") || !strcmp(sub,"move")) {
         preset_lock=open("/tmp/neck.lock",O_RDWR|O_CREAT,0644);
         if(preset_lock<0 || flock(preset_lock,LOCK_EX)<0) { if(preset_lock>=0) close(preset_lock); return 4; }
     }
@@ -176,16 +176,19 @@ static int cmd_neck(int argc, char **argv) {
         neck_release(fd);
         save_pos(x, y);
         printf("homed (%d h, %d v steps to switches); position=%d %d\n", hx, vy, x, y);
-    } else if (!strcmp(sub, "goto") || !strcmp(sub,"preset")) {
-        int is_preset=!strcmp(sub,"preset");
-        if (argc < (is_preset?4:5)) { close(fd); return 1; }
+    } else if (!strcmp(sub, "goto") || !strcmp(sub,"preset") || !strcmp(sub,"move")) {
+        int is_preset=!strcmp(sub,"preset"),is_move=!strcmp(sub,"move");
+        if (argc < (is_preset || is_move?4:5)) { close(fd); return 1; }
         if (!have_pos) { fprintf(stderr, "position unknown - run: hkctl neck home\n"); close(fd); return 3; }
         int tx,ty;
-        if(is_preset) {
+        if(is_move) {
+            char *end; long direction=strtol(argv[3],&end,10); int px,py; load_park(&px,&py);
+            if(*end || direction<0 || direction>4 || !camera_move_target((int)direction,x,y,px,py,&tx,&ty)) { close(fd); close(preset_lock); return 1; }
+        } else if(is_preset) {
             char *end; long index=strtol(argv[3],&end,10); int px,py; load_park(&px,&py);
             if(*end || index<0 || index>10 || !camera_preset_target((int)index,px,py,&tx,&ty)) { close(fd); close(preset_lock); return 1; }
         } else { tx=atoi(argv[3]); ty=atoi(argv[4]); }
-        int delay = !is_preset && argc > 5 ? atoi(argv[5]) : DEFAULT_DELAY_US;
+        int delay = !is_preset && !is_move && argc > 5 ? atoi(argv[5]) : DEFAULT_DELAY_US;
         if (tx < X_MIN_SOFT) tx = X_MIN_SOFT; if (tx > X_MAX_SOFT) tx = X_MAX_SOFT;
         if (ty < Y_MIN_SOFT) ty = Y_MIN_SOFT; if (ty > Y_MAX_SOFT) ty = Y_MAX_SOFT;
         neck_step(fd, AXIS_H, tx > x ? 1 : -1, abs(tx - x), delay, &x, X_MIN_SOFT, X_MAX_SOFT);
@@ -704,7 +707,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[1], "ioctl")) rc = cmd_ioctl(argc, argv);
     }
     if (rc == 1) fprintf(stderr,
-        "usage: hkctl neck status|release|home [delay]|step h|v +|- <n> [delay]|goto <x> <y> [delay]\n"
+        "usage: hkctl neck status|release|home [delay]|step h|v +|- <n> [delay]|goto <x> <y> [delay]|move <0=center,1=left,2=right,3=up,4=down>\n"
         "       hkctl ircut day|night | hkctl light | hkctl serve [port] | hkctl ioctl <dev> <cmd> [arg]\n");
     return rc;
 }
