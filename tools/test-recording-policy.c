@@ -4,10 +4,13 @@
 #include <assert.h>
 #include <time.h>
 static long long test_ms=100000;
+static time_t wall_time=946684800;
+static time_t test_wall_clock(time_t *out) { if(out) *out=wall_time; return wall_time; }
 static int test_clock(clockid_t id,struct timespec *t) {
     (void)id; t->tv_sec=test_ms/1000; t->tv_nsec=(test_ms%1000)*1000000; return 0;
 }
 #define clock_gettime test_clock
+#define time test_wall_clock
 #define MOTION_GUARD_FILE "/tmp/plug2view-policy-test/guard"
 #define main camera_main
 #include "../camera/src/camd.c"
@@ -18,6 +21,13 @@ static void existing_motion_file(void) {
     rec_mdat_pos=0; rec_active=1; strcpy(rec_name,"isolated-policy-test");
 }
 int main(void) {
+    last_frame_ms=test_ms;
+    wall_time=1793234586; assert(!capture_stalled()); /* NTP steps forwards */
+    wall_time=946684800; assert(!capture_stalled()); /* and backwards */
+    test_ms+=10000; assert(!capture_stalled());
+    test_ms++; assert(capture_stalled());
+    last_frame_ms=test_ms; assert(!capture_stalled());
+    puts("PASS: video stall deadline ignores wall-clock steps and expires after 10 seconds");
     assert(mkdir("/tmp/plug2view-policy-test",0700)==0);
     assert(!motion_suppressed());
     int guard=motion_guard_begin(); assert(guard>=0); assert(motion_suppressed());

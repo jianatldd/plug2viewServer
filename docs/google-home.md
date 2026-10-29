@@ -1,5 +1,9 @@
 # Google Home camera experiment
 
+For the proposed head/child architecture, registration, and direct UDP streaming,
+see the [multi-camera deployment plan](multi-camera-plan.md). The setup below
+describes the current single-camera implementation.
+
 Hostnames and network addresses in this public guide are placeholders. Use the
 values in your ignored local configs when running setup commands; keep those
 values and credentials out of commits. See the README's publishing check.
@@ -632,6 +636,18 @@ TURN servers. The public address is resolved at daemon startup; with DuckDNS
 maintenance enabled, new sessions also read its latest verified IP update.
 A LAN test cannot verify the public port forward.
 
+At boot, capture can start before Wi-Fi has an address and route. A failed
+WebRTC initialization now releases its sockets and crypto state, then retries
+after five seconds until ready. The timer uses monotonic time, so NTP clock
+corrections do not delay recovery. It does not restart healthy sessions or the
+capture/recording service. Local WebRTC authenticates the peer's SDP certificate
+fingerprint and does not wait for wall-clock synchronization; Google authorization
+and certificate maintenance still need the correct time. This retry handles
+startup failure, not a later change of the camera's LAN address.
+
+The `webrtc` object in `/?action=status` reports `ready` and `startup_attempts`.
+`/tmp/camd.log` identifies the failed startup stage and the next retry.
+
 ```powershell
 node tools/build-webrtc.js --zig .build/zig-x86_64-windows-0.14.1/zig.exe --fetch
 node tools/build.js --zig .build/zig-x86_64-windows-0.14.1/zig.exe --webrtc camd
@@ -677,13 +693,16 @@ arriving during the same 30-second setup window. Only an identical request ID
 reuses the token/SDP; setup deadlines are never extended.
 
 Build isolated session regressions with
-`node tools/build-webrtc-tests.js --zig <zig-path>`, then run the three binaries
+`node tools/build-webrtc-tests.js --zig <zig-path>`, then run the four binaries
 from `.build/webrtc-tests/` in the camera's `/tmp` directory. They do not stop or
 replace the live daemon. The session test uses an ephemeral UDP port and checks
 10 independent SRTP recipients, authenticated ICE routing, PLI isolation, full
 capacity, timeout reclamation, and stale-handle cleanup. The signaling test
 checks separate browser/phone/Hub tokens, exact request retries, capacity,
-cleanup, and stale-token rejection. These isolated tests passed on the camera;
+cleanup, and stale-token rejection. The startup test injects repeated route,
+bind, nonblocking-mode, and frame-allocation failures, checks resource cleanup
+and timed recovery, and verifies that a healthy session is not restarted.
+These isolated tests passed on the camera;
 they do not establish sustained video throughput or browser DTLS interoperability.
 
 On the display: “Hey Google, sync my devices”, then “Hey Google, show Plug2View

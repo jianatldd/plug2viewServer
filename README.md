@@ -87,6 +87,17 @@ and certificate reloads preserve running streams. Port 80 is unnecessary.
 The maintenance executables require the SD card; credentials and certificates
 are stored in private camera flash. See the Google Home setup guide above.
 
+Planned multi-camera support uses one HTTPS head node and direct WebRTC from each
+camera on its own configured UDP port. See the
+[multi-camera deployment plan](docs/multi-camera-plan.md) for registration,
+router forwarding, and implementation scope; this is not implemented yet.
+
+Additional integration proposals are documented in the
+[native HomeKit and Alexa plan](docs/homekit-alexa-plan.md) and the
+[Matter camera plan](docs/matter-camera-plan.md). Both are unimplemented:
+HomeKit and Matter need hardware feasibility checks, and the documented Alexa
+WebRTC route requires a cloud signaling endpoint.
+
 - **`main`** — current: H.264 live view (WebRTC with MP4/MSE fallback), MP4 motion recordings
   from the module's hardware encoder, and **HTTPS** (BearSSL built into `camd`).
 - **`mjpg-video`** branch — the earlier MJPEG version (`mjpgd`: MJPEG live stream that

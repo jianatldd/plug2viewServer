@@ -12,6 +12,15 @@ case "$1" in
         if ! ifconfig eth2 2>/dev/null | grep -q 'inet addr'; then
             route del default 2>/dev/null
             [ -n "$router" ] && route add default gw ${router%% *} dev $interface
+            # Wi-Fi owns the default route, so use its DHCP-provided resolvers.
+            # The RAM-backed root filesystem loses resolv.conf across reboots.
+            if [ -n "$dns" ]; then
+                : > /etc/resolv.conf.wifi
+                for server in $dns; do
+                    printf 'nameserver %s\n' "$server" >> /etc/resolv.conf.wifi
+                done
+                mv /etc/resolv.conf.wifi /etc/resolv.conf
+            fi
         fi
         ;;
 esac

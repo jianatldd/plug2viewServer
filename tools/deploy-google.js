@@ -1,4 +1,4 @@
-// Reversible upgrade of camd + start.sh, with optional Google config/public cert.
+// Reversible upgrade of camd, hkctl, start.sh and wifi.sh, with optional Google config/public cert.
 // node tools/deploy-google.js [--config camera/google.conf] [--public-cert]
 // node tools/deploy-google.js --rollback
 'use strict';
@@ -12,12 +12,12 @@ if (!pc) throw new Error('Pass --pc with this computer’s LAN IP');
 const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'plug2view-google-'));
 const base = '/mnt/sif/owrt';
 const latest = '/media/sda1/plug2view/.deploy-last-good';
-const files = [ ['camera/payload/camd', 'camd', `${base}/bin/camd`], ['camera/payload/hkctl','hkctl',`${base}/bin/hkctl`], ['camera/start.sh', 'start.sh', `${base}/start.sh`] ];
+const files = [ ['camera/payload/camd', 'camd', `${base}/bin/camd`], ['camera/payload/hkctl','hkctl',`${base}/bin/hkctl`], ['camera/start.sh', 'start.sh', `${base}/start.sh`], ['camera/wifi.sh', 'wifi.sh', `${base}/wifi.sh`] ];
 if (opt('--config')) files.push([path.resolve(opt('--config')), 'google.conf', `${base}/google.conf`]);
 // Recovery only: restore a previously saved generation without invalidating its tokens.
 if (opt('--state')) files.push([path.resolve(opt('--state')), 'google.conf.state', `${base}/google.conf.state`]);
 if (args.includes('--public-cert')) files.push(['camera/tls/public/cert.der', 'cert.der', `${base}/tls/cert.der`], ['camera/tls/public/key.der', 'key.der', `${base}/tls/key.der`]);
-const optional = ['google.conf', 'google.conf.state', 'tls/cert.der', 'tls/key.der'];
+const optional = ['google.conf', 'google.conf.state', 'tls/cert.der', 'tls/key.der', 'wifi.sh'];
 const rollback = `#!/bin/sh\nset -e\nB=${base}\n[ -f $B/google-backup/camd ] || exit 1\n$B/start.sh stop\ncp $B/google-backup/camd $B/bin/camd\ncp $B/google-backup/start.sh $B/start.sh\n` + optional.map(name => `if [ -f $B/google-backup/${name} ]; then cp $B/google-backup/${name} $B/${name}; elif [ -f $B/google-backup/absent-${name.replaceAll('/', '_')} ]; then rm -f $B/${name}; fi\n`).join('') + '$B/start.sh\n';
 const rollbackWithControls=rollback.replace(/\n\$B\/start\.sh\n$/,'\nif [ -f $B/google-backup/hkctl ]; then cp $B/google-backup/hkctl $B/bin/hkctl; fi\n$B/start.sh\n');
 const recover = rollbackWithControls.replaceAll('$B/google-backup', latest);

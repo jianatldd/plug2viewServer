@@ -420,7 +420,9 @@ static void handle(int c) {
     if (q) *q++ = 0; else q = "";
     if (is_post) { char *b = strstr(end + 1, "\r\n\r\n"); if (b) q = b + 4; }
 
-    if (!strcmp(path, "/wifi/scan")) {
+    if (!strcmp(path, "/health")) {
+        respond(c, 200, "{\"ok\":true}");
+    } else if (!strcmp(path, "/wifi/scan")) {
         wifi_scan(big, sizeof big);
         respond(c, 200, big);
         return;
@@ -601,12 +603,63 @@ static int local_get(int port, const char *path, char *resp, int n) {
     return !strncmp(resp, "HTTP/1.0 200", 12);
 }
 
+#ifndef MOTION_HEARTBEAT
+#define MOTION_HEARTBEAT "/tmp/plug2view-motion-heartbeat"
+#endif
+static void motion_heartbeat(void) {
+    FILE *f=fopen(MOTION_HEARTBEAT ".next","w");
+    if(!f) return;
+    int ok=fprintf(f,"%ld %lld\n",(long)getpid(),recording_clock_ms())>0;
+    if(fclose(f)) ok=0;
+    if(ok) rename(MOTION_HEARTBEAT ".next",MOTION_HEARTBEAT);
+}
+
+/* Short-lived watchdog probes: one deadline covers connect, write and all reads. */
+static int cmd_health(int argc,char **argv) {
+    if(argc!=4) return 2;
+    signal(SIGALRM,SIG_DFL); signal(SIGPIPE,SIG_IGN); alarm(5);
+    int ok=0;
+    if(!strcmp(argv[2],"motion")) {
+        long pid=0; long long stamp=0,now=recording_clock_ms();
+        FILE *f=fopen(MOTION_HEARTBEAT,"r");
+        if(f) { ok=fscanf(f,"%ld %lld",&pid,&stamp)==2 && pid>0 && pid==atol(argv[3]) && now>=stamp && now-stamp<30000; fclose(f); }
+    } else {
+        int port=atoi(argv[3]); char response[2048];
+        const char *path=NULL,*expected=NULL;
+        if(!strcmp(argv[2],"video")) { path="/?action=status"; expected="\"fps\":"; }
+        if(!strcmp(argv[2],"controls")) { path="/health"; expected="\"ok\":true"; }
+        if(path && port>0 && port<=65535 && local_get(port,path,response,sizeof response)) {
+            char *body=strstr(response,"\r\n\r\n"); ok=body && strstr(body+4,expected)!=NULL;
+        }
+    }
+    alarm(0); return ok?0:2;
+}
+
+/* Hold the lock only in this parent; service children must not inherit it. */
+#ifndef WATCH_LOCK
+#define WATCH_LOCK "/tmp/plug2view-watch.lock"
+#define WATCH_SCRIPT "/mnt/sif/owrt/start.sh"
+#endif
+static int cmd_watch(void) {
+    int fd=open(WATCH_LOCK,O_RDWR|O_CREAT,0600);
+    if(fd<0) return 2;
+    if(flock(fd,LOCK_EX|LOCK_NB)) { close(fd); return 0; }
+    signal(SIGCHLD,SIG_DFL);
+    pid_t child=fork();
+    if(child==0) { close(fd); execl("/bin/sh","sh",WATCH_SCRIPT,"check",(char *)NULL); _exit(127); }
+    int status=0;
+    if(child<0) { close(fd); return 2; }
+    pid_t done; do { done=waitpid(child,&status,0); } while(done<0 && errno==EINTR);
+    close(fd); return done==child && WIFEXITED(status)?WEXITSTATUS(status):2;
+}
+
 static int cmd_motion(int argc, char **argv) {
     int port = argc > 2 ? atoi(argv[2]) : 8080;
     time_t active_until = 0, last_save = 0, last_event = 0; unsigned saved = 0, events = 0;
     int streak = 0;                              /* consecutive polls with motion (debounce) */
     struct mcfg m={-1,0,0,0};
     fprintf(stderr, "motion daemon: polling, saving to video port %d\n", port);
+    motion_heartbeat();
     for (;;) {
         struct mcfg next; motion_cfg(&next);
         if(next.on!=m.on || next.threshold!=m.threshold || next.zones!=m.zones || next.confirm!=m.confirm) { m=next; motion_apply(&m); }
@@ -639,6 +692,7 @@ static int cmd_motion(int argc, char **argv) {
                             "\"threshold\":%d,\"zones\":%d,\"confirm\":%d,\"suppressed\":%s}\n",
                          m.on ? "true" : "false", now < active_until ? "true" : "false", mask < 0 ? 0 : mask, events, saved, (long)last_event,
                          m.threshold, m.zones, m.confirm, suppressed?"true":"false"); fclose(f); }
+        motion_heartbeat();
         usleep(500000);                           /* 2 polls/s: ~1 s to trigger with confirm=2 */
     }
 }
@@ -698,6 +752,8 @@ int main(int argc, char **argv) {
     int rc = 1;
     if (argc >= 2) {
         if (!strcmp(argv[1], "daemon")) rc = cmd_daemon(argc, argv);
+        else if (!strcmp(argv[1], "health")) rc = cmd_health(argc, argv);
+        else if (!strcmp(argv[1], "watch")) rc = cmd_watch();
         else if (!strcmp(argv[1], "vidinfo")) rc = cmd_vidinfo(argc, argv);
         else if (!strcmp(argv[1], "motion")) rc = cmd_motion(argc, argv);
         else if (!strcmp(argv[1], "serve")) rc = cmd_serve(argc, argv);

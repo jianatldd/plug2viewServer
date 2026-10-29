@@ -46,6 +46,44 @@ firmware details, and pitfalls to avoid.
 - Watchdog: `/bin/watchdog` is a trivial open/write/sleep loop on `/dev/watchdog`.
   `hkipc` strings include `killall watchdog; reboot`.
 
+## Service recovery
+
+`start.sh` installs a minute cron hook that runs `hkctl watch`. An advisory lock
+prevents overlapping checks; it is released when the watchdog exits. Missing
+`camd`, control-server or motion processes are started on the next check.
+For running services, a failed check is remembered by PID. Two consecutive
+failures for the same PID set trigger a targeted restart, typically within
+about two minutes. A successful check or replacement PID resets the failure.
+
+The video check requests loopback `/?action=status`; the controls check requests
+loopback `/health`. Each probe has a five-second deadline covering connection,
+write and response reading. The motion worker writes its PID and monotonic time
+after each loop; a missing, mismatched or 30-second-old heartbeat fails its check.
+Only failed services receive TERM, CONT (to release a stopped process), and KILL
+after two seconds if they remain. Healthy video sessions continue through a
+control/motion-worker restart. `start.sh stop` disables service recovery.
+
+Recovery hooks are installed before NTP is attempted. Wi-Fi similarly registers
+its minute retry before its first association/DHCP attempt; `wifi.sh off` removes
+that hook. The video capture-stall deadline and reported frame age use monotonic
+time, so wall-clock corrections cannot trigger or postpone the ten-second stall
+exit. WebRTC independently retries failed initialization every five seconds.
+
+Diagnostics: `/tmp/plug2view-watch.log` (rotated at 64 KB), failure markers under
+`/tmp/plug2view-watch/`, and `/tmp/plug2view-motion-heartbeat`. These are RAM files.
+This is process recovery: it does not recover a dead cron daemon or reboot a hung
+kernel. A hardware operation stuck in uninterruptible kernel sleep may remain
+despite KILL, and a frozen recorder may not finalize its current clip.
+
+Build isolated tests with `node tools/build-service-tests.js --zig <zig-path>`.
+Copy the five files in `.build/service-tests/` into a temporary camera directory
+and run `./test-service-health`, `./test-recording-policy`, and
+`sh test-service-watchdog.sh ./start-test-source.sh ./wifi-test-source.sh`.
+The tests use private temporary files, ephemeral sockets and mocked process/network
+actions. They cover hung-response deadlines, heartbeat freshness, watchdog locking,
+selective restart/escalation, failure reset, deliberate stops, first-join failure,
+and wall-clock-independent capture timeouts without interrupting live capture.
+
 ## The traps (each cost a reboot)
 
 1. **Killing `hkipc` reboots the camera** — via `runhkipc stop`, `killall`, and even

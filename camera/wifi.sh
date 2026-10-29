@@ -29,15 +29,21 @@ case "$1" in
     off)    rm -f /tmp/hk-watch/wifi
             [ -f $PIDF ] && kill `cat $PIDF` 2>/dev/null; rm -f $PIDF
             ifconfig $IF 0.0.0.0 down; exit 0 ;;
-    check)  [ -f $CONF ] || exit 0
-            connected && has_ip && exit 0
-            echo "wifi check: link lost, re-joining ($(date))" ;;
+    check)  [ -f $CONF ] || exit 0 ;;
 esac
 
 [ -f $CONF ] || exit 0
 . $CONF
 [ -n "$SSID" ] || exit 0
 AUTH=${AUTH:-WPA2PSK}; ENC=${ENC:-AES}
+
+# Register recovery before association/DHCP can fail, including the first boot.
+mkdir -p /tmp/hk-watch
+echo "sh $BASE/wifi.sh check >>/tmp/wifi.log 2>&1" > /tmp/hk-watch/wifi
+if [ "$1" = check ]; then
+    connected && has_ip && exit 0
+    echo "wifi check: link lost, re-joining ($(date))"
+fi
 
 [ -f $PIDF ] && kill `cat $PIDF` 2>/dev/null; rm -f $PIDF
 ifconfig $IF up
@@ -61,7 +67,3 @@ connected || { echo "wifi: not associated with '$SSID'"; exit 1; }
 /bin/busybox udhcpc -b -i $IF -s $BASE/wifi-dhcp.sh -p $PIDF
 sleep 4
 status
-
-# Self-heal: cron runs every file in /tmp/hk-watch once a minute.
-mkdir -p /tmp/hk-watch
-echo "sh $BASE/wifi.sh check >>/tmp/wifi.log 2>&1" > /tmp/hk-watch/wifi

@@ -86,7 +86,8 @@ static struct hframe ring[RING_MAX];
 static unsigned ring_head = 0, ring_count = 0;   /* ring[(head - 1) % RING_MAX] is newest */
 static size_t ring_bytes = 0;
 static unsigned frame_seq = 0;
-static time_t last_frame_time = 0;
+static long long last_frame_ms = 0;
+static int capture_stalled(void) { return recording_clock_ms() - last_frame_ms > 10000; }
 static unsigned stat_frames = 0; static unsigned long long stat_bytes = 0; static long long stat_t0 = 0;
 static void hls_tick(void);
 static double stat_fps = 0, stat_mbps = 0;
@@ -162,7 +163,7 @@ static void cam_grab(void) {
     if (n > 8 && n <= klen[b.index] && d[0] == 0 && d[1] == 0) {
         long long ts = now_us();
         ring_push(d, n, ts);
-        last_frame_time = time(NULL);
+        last_frame_ms = recording_clock_ms();
         stat_frames++; stat_bytes += n;
         if (!stat_t0) stat_t0 = ts;
         if (ts - stat_t0 >= 5000000) { stat_fps = stat_frames * 1e6 / (ts - stat_t0); stat_mbps = stat_bytes * 8.0 / (ts - stat_t0); stat_frames = 0; stat_bytes = 0; stat_t0 = ts; }
@@ -798,7 +799,7 @@ static void handle_request(struct client *c) {
         if (*query) query[-1] = 0;
         struct google_response r;
         google_handle(is_options ? "OPTIONS" : is_post ? "POST" : "GET", path, query, c->body ? (char *)c->body : "", raw,
-                      c->tls != NULL || c->local, last_frame_time && time(NULL) - last_frame_time < 10, &r);
+                      c->tls != NULL || c->local, last_frame_ms && recording_clock_ms() - last_frame_ms < 10000, &r);
         /* Warm the HLS stream as soon as Google asks for it, before the player fetches. */
         if (r.code == 200 && strstr(r.body, "cameraStreamAccessUrl")) hls_start();
         send_simple(c, r.code, r.type, r.body, r.extra); return;
@@ -893,7 +894,7 @@ static void handle_request(struct client *c) {
         struct hframe *nf = ring_newest();
         char rtc[600]; rtc_status(rtc, sizeof rtc);
         snprintf(body, sizeof body, "{\"fps\":%.1f,\"mbps\":%.2f,\"viewers\":%d,\"recording\":%s,\"manual_recording\":%s,\"recording_limit_seconds\":300,\"recording_remaining_seconds\":%lld,\"rec_samples\":%u,\"ring_frames\":%u,\"ring_kb\":%zu,\"frame_age_ms\":%lld,\"webrtc\":%s}",
-                 stat_fps, stat_mbps, live_viewers(), rec_fd >= 0 ? "true" : "false", rec_manual?"true":"false", rec_manual?(rec_manual_until-recording_clock_ms()+999)/1000:0LL, rec_nsamples, ring_count, ring_bytes / 1024, nf ? (now_us() - nf->ts) / 1000 : -1LL, rtc);
+                 stat_fps, stat_mbps, live_viewers(), rec_fd >= 0 ? "true" : "false", rec_manual?"true":"false", rec_manual?(rec_manual_until-recording_clock_ms()+999)/1000:0LL, rec_nsamples, ring_count, ring_bytes / 1024, nf ? recording_clock_ms() - last_frame_ms : -1LL, rtc);
         send_json(c, 200, body);
         return;
     }
@@ -975,7 +976,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < MAXCLI; i++) cli[i].fd = -1;
     vfd = cam_open(dev, v4l2_fourcc('H', '2', '6', '4'), 1280, 720, NBUF);
     if (vfd < 0) die("H.264 capture");
-    last_frame_time = time(NULL);
+    last_frame_ms = recording_clock_ms();
     cam_ctrl(vfd, V4L2_CID_POWER_LINE_FREQUENCY, plfreq == 60 ? 2 : plfreq == 50 ? 1 : 0, "power_line_frequency");
 
     lfd = socket(AF_INET, SOCK_STREAM, 0); int one = 1; setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -1088,7 +1089,7 @@ int main(int argc, char **argv) {
         time_t now = time(NULL);
         rec_expire();
         for (int i = 0; i < MAXCLI; i++) if (cli[i].fd >= 0 && !cli[i].live && now - cli[i].activity > 30) cli_close(&cli[i]);
-        if (last_frame_time && now - last_frame_time > 10) { fprintf(stderr, "no frames for 10 s, exiting for restart\n"); rec_stop(); exit(3); }
+        if (capture_stalled()) { fprintf(stderr, "no frames for 10 s, exiting for restart\n"); rec_stop(); exit(3); }
         if (rec_fd >= 0 && now - rec_last_write > REC_IDLE_CLOSE) { fprintf(stderr, "recording idle, closing\n"); rec_stop(); }
     }
 }

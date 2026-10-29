@@ -32,6 +32,9 @@
 #ifndef RTC_PORT
 #define RTC_PORT 50000
 #endif
+#ifndef RTC_STARTUP_RETRY_MS
+#define RTC_STARTUP_RETRY_MS 5000
+#endif
 #define AU_MAX (128 * 1024)
 /* One shared queue absorbs large IDR encryption bursts across ten peers. */
 #define QUEUE 8
@@ -46,8 +49,8 @@ int mbedtls_hardware_poll(void *ctx, unsigned char *out, size_t len, size_t *ole
     close(fd); return 0;
 }
 static struct {
-    int started, ready, fd;
-    unsigned next_id;
+    int started, ready, fd, srtp_started;
+    unsigned next_id, startup_attempts;
     char host[256], lan[INET_ADDRSTRLEN], public_ip[INET_ADDRSTRLEN], fingerprint[96];
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context rng;
@@ -158,7 +161,7 @@ void rtc_end(unsigned id) { pthread_mutex_lock(&mu); struct rtc_session *r=find_
 void rtc_end_all(void) { pthread_mutex_lock(&mu); for(int i=0;i<RTC_MAX_SESSIONS;i++) stop_session(&sessions[i],"signaling all"); pthread_mutex_unlock(&mu); }
 static void status_locked(struct rtc_session *r,char *out, size_t cap) {
     pthread_mutex_lock(&qm); unsigned dropped=q.dropped, queued=q.count; int waiting=q.need_key || r->need_key; pthread_mutex_unlock(&qm);
-    snprintf(out,cap,"{\"active\":%d,\"connected\":%d,\"max_sessions\":%d,\"frames\":%u,\"packets\":%u,\"rtcp\":%u,\"rtcp_bad\":%u,\"pli\":%u,\"nack\":%u,\"resent\":%u,\"cache_miss\":%u,\"send_errors\":%u,\"lost\":%d,\"loss_fraction\":%u,\"jitter_ms\":%u,\"queue_drops\":%u,\"queued\":%u,\"waiting_key\":%d,\"age_ms\":%llu,\"consent_age_ms\":%llu}",r->active,r->connected,RTC_MAX_SESSIONS,r->frames,r->packets,r->rtcp_ok,r->rtcp_bad,r->pli,r->nack,r->retransmitted,r->cache_miss,r->send_errors,r->lost,r->loss_fraction,r->jitter/90,dropped,queued,waiting,(unsigned long long)(r->active?monotonic_ms()-r->created:0),(unsigned long long)(r->nominated?monotonic_ms()-r->consent:0));
+    snprintf(out,cap,"{\"ready\":%s,\"startup_attempts\":%u,\"active\":%d,\"connected\":%d,\"max_sessions\":%d,\"frames\":%u,\"packets\":%u,\"rtcp\":%u,\"rtcp_bad\":%u,\"pli\":%u,\"nack\":%u,\"resent\":%u,\"cache_miss\":%u,\"send_errors\":%u,\"lost\":%d,\"loss_fraction\":%u,\"jitter_ms\":%u,\"queue_drops\":%u,\"queued\":%u,\"waiting_key\":%d,\"age_ms\":%llu,\"consent_age_ms\":%llu}",transport.ready?"true":"false",transport.startup_attempts,r->active,r->connected,RTC_MAX_SESSIONS,r->frames,r->packets,r->rtcp_ok,r->rtcp_bad,r->pli,r->nack,r->retransmitted,r->cache_miss,r->send_errors,r->lost,r->loss_fraction,r->jitter/90,dropped,queued,waiting,(unsigned long long)(r->active?monotonic_ms()-r->created:0),(unsigned long long)(r->nominated?monotonic_ms()-r->consent:0));
 }
 void rtc_status(char *out, size_t cap) {
     pthread_mutex_lock(&mu);
@@ -373,10 +376,28 @@ static int make_certificate(void) {
     for(int i=0;i<32;i++) sprintf(transport.fingerprint+3*i,i==31?"%02X":"%02X:",digest[i]);
 done: mbedtls_mpi_free(&number); mbedtls_x509write_crt_free(&crt); return ret==0;
 }
+/* Only used before ready is published: no session can reference these objects. */
+static void cleanup_initialization(void) {
+    if(transport.fd>=0) { close(transport.fd); transport.fd=-1; }
+    mbedtls_ssl_config_free(&transport.conf); mbedtls_x509_crt_free(&transport.cert);
+    mbedtls_pk_free(&transport.key); mbedtls_ctr_drbg_free(&transport.rng); mbedtls_entropy_free(&transport.entropy);
+    if(transport.srtp_started) { srtp_shutdown(); transport.srtp_started=0; }
+    transport.lan[0]=transport.public_ip[0]=transport.fingerprint[0]=0;
+}
+static const char *startup_error;
 static int initialize(void) {
     mbedtls_entropy_init(&transport.entropy); mbedtls_ctr_drbg_init(&transport.rng); mbedtls_pk_init(&transport.key); mbedtls_x509_crt_init(&transport.cert); mbedtls_ssl_config_init(&transport.conf);
-    if(!make_certificate() || srtp_init()!=srtp_err_status_ok) return 0;
-    if(mbedtls_ssl_config_defaults(&transport.conf,MBEDTLS_SSL_IS_SERVER,MBEDTLS_SSL_TRANSPORT_DATAGRAM,MBEDTLS_SSL_PRESET_DEFAULT)) return 0;
+    /* Probe before allocating crypto state. Wi-Fi commonly joins after camd starts. */
+    startup_error="network route";
+    int probe=socket(AF_INET,SOCK_DGRAM,0); struct sockaddr_in a={.sin_family=AF_INET,.sin_port=htons(53)}; inet_pton(AF_INET,"8.8.8.8",&a.sin_addr);
+    socklen_t alen=sizeof a; if(probe<0) goto fail;
+    int ok=!connect(probe,(struct sockaddr *)&a,sizeof a) && !getsockname(probe,(struct sockaddr *)&a,&alen) && inet_ntop(AF_INET,&a.sin_addr,transport.lan,sizeof transport.lan);
+    close(probe); if(!ok || a.sin_addr.s_addr==INADDR_ANY) goto fail;
+    startup_error="certificate"; if(!make_certificate()) goto fail;
+    startup_error="SRTP"; if(srtp_init()!=srtp_err_status_ok) goto fail;
+    transport.srtp_started=1;
+    startup_error="DTLS configuration";
+    if(mbedtls_ssl_config_defaults(&transport.conf,MBEDTLS_SSL_IS_SERVER,MBEDTLS_SSL_TRANSPORT_DATAGRAM,MBEDTLS_SSL_PRESET_DEFAULT)) goto fail;
     static const int ciphers[]={MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,0};
     static const mbedtls_ssl_srtp_profile profiles[]={MBEDTLS_TLS_SRTP_AES128_CM_HMAC_SHA1_80,MBEDTLS_TLS_SRTP_UNSET};
     mbedtls_ssl_conf_ciphersuites(&transport.conf,ciphers); mbedtls_ssl_conf_rng(&transport.conf,mbedtls_ctr_drbg_random,&transport.rng);
@@ -385,24 +406,36 @@ static int initialize(void) {
      * verification callback replaces CA identity with its SDP fingerprint. */
     mbedtls_ssl_conf_ca_chain(&transport.conf,&transport.cert,NULL);
     mbedtls_ssl_conf_cert_req_ca_list(&transport.conf,MBEDTLS_SSL_CERT_REQ_CA_LIST_DISABLED);
-    if(mbedtls_ssl_conf_own_cert(&transport.conf,&transport.cert,&transport.key) || mbedtls_ssl_conf_dtls_srtp_protection_profiles(&transport.conf,profiles)) return 0;
+    if(mbedtls_ssl_conf_own_cert(&transport.conf,&transport.cert,&transport.key) || mbedtls_ssl_conf_dtls_srtp_protection_profiles(&transport.conf,profiles)) goto fail;
     mbedtls_ssl_conf_handshake_timeout(&transport.conf,500,4000);
-    /* Host address selected by the route to the public Internet. No data sent. */
-    int probe=socket(AF_INET,SOCK_DGRAM,0); struct sockaddr_in a={.sin_family=AF_INET,.sin_port=htons(53)}; inet_pton(AF_INET,"8.8.8.8",&a.sin_addr);
-    socklen_t alen=sizeof a; if(probe<0) return 0;
-    int ok=!connect(probe,(struct sockaddr *)&a,sizeof a) && !getsockname(probe,(struct sockaddr *)&a,&alen) && inet_ntop(AF_INET,&a.sin_addr,transport.lan,sizeof transport.lan); close(probe); if(!ok) return 0;
     struct addrinfo hint={.ai_family=AF_INET,.ai_socktype=SOCK_DGRAM},*ai=NULL;
     if(!getaddrinfo(transport.host,NULL,&hint,&ai)) { inet_ntop(AF_INET,&((struct sockaddr_in *)ai->ai_addr)->sin_addr,transport.public_ip,sizeof transport.public_ip); freeaddrinfo(ai); }
-    transport.fd=socket(AF_INET,SOCK_DGRAM,0); if(transport.fd<0) return 0;
+    startup_error="UDP socket";
+    transport.fd=socket(AF_INET,SOCK_DGRAM,0); if(transport.fd<0) goto fail;
     int size=256*1024; setsockopt(transport.fd,SOL_SOCKET,SO_SNDBUF,&size,sizeof size);
     a.sin_addr.s_addr=INADDR_ANY; a.sin_port=htons(RTC_PORT);
-    if(bind(transport.fd,(struct sockaddr *)&a,sizeof a) || fcntl(transport.fd,F_SETFL,O_NONBLOCK)<0) return 0;
+    startup_error="UDP bind"; if(bind(transport.fd,(struct sockaddr *)&a,sizeof a)) goto fail;
+    startup_error="UDP nonblocking mode"; if(fcntl(transport.fd,F_SETFL,O_NONBLOCK)<0) goto fail;
     return 1;
+fail:
+    cleanup_initialization(); return 0;
 }
 static void *worker(void *unused) {
-    (void)unused; int ok=initialize(); pthread_mutex_lock(&mu); transport.ready=ok; pthread_mutex_unlock(&mu);
-    fprintf(stderr,"webrtc: %s (UDP %d, ICE-lite, H264, max %d peers)\n",ok?"ready":"initialization failed",RTC_PORT,RTC_MAX_SESSIONS); if(!ok) return NULL;
-    unsigned char *frame=malloc(AU_MAX); if(!frame) { pthread_mutex_lock(&mu); transport.ready=0; pthread_mutex_unlock(&mu); return NULL; }
+    (void)unused; unsigned char *frame=NULL;
+    for(;;) {
+        pthread_mutex_lock(&mu); unsigned attempt=++transport.startup_attempts; pthread_mutex_unlock(&mu);
+        if(initialize()) {
+            frame=malloc(AU_MAX); if(frame) break;
+            startup_error="frame buffer"; cleanup_initialization();
+        }
+        fprintf(stderr,"webrtc: initialization failed at %s; retry in %d ms (attempt %u)\n",startup_error,RTC_STARTUP_RETRY_MS,attempt);
+        /* No wall-clock dependency: NTP may step the clock after Wi-Fi joins.
+         * Local WebRTC uses the SDP fingerprint, not CA certificate dates. */
+        uint64_t deadline=monotonic_ms()+RTC_STARTUP_RETRY_MS, now;
+        while((now=monotonic_ms())<deadline) poll(NULL,0,(int)(deadline-now));
+    }
+    pthread_mutex_lock(&mu); transport.ready=1; pthread_mutex_unlock(&mu);
+    fprintf(stderr,"webrtc: ready (UDP %d, ICE-lite, H264, max %d peers)\n",RTC_PORT,RTC_MAX_SESSIONS);
     for(;;) {
         struct pollfd p={.fd=transport.fd,.events=POLLIN}; poll(&p,1,5);
         pthread_mutex_lock(&mu);

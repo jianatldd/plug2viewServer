@@ -8,6 +8,7 @@ const out=path.join(root,'.build/webrtc-tests');fs.mkdirSync(out,{recursive:true
 const base=['cc','-target','mipsel-linux-musleabi','-mcpu=mips32','-Os','-static','-s','-Icamera/src'];
 const media=['-DP2V_WEBRTC','-DMBEDTLS_CONFIG_FILE="webrtc-mbedtls.h"','-I.build/webrtc/mbedtls/include','-I.build/webrtc/libsrtp/include','-pthread'];
 for(const [name,flags,libs] of [
+ ['startup',media,['.build/webrtc/libwebrtc.a']],
  ['sessions',media,['.build/webrtc/libwebrtc.a']],
  ['signaling',['-DP2V_WEBRTC'],['camera/src/bearssl/libbearssl.a']],
  ['sdp',['-UNDEBUG'],[]]
