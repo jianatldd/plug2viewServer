@@ -8,7 +8,7 @@ firmware details, and pitfalls to avoid.
 | Part | Detail |
 | --- | --- |
 | SoC | Ralink RT3xxx-class, MIPS 24K **little-endian** (`mipsel`), no FPU (soft-float), 240 BogoMIPS |
-| RAM | 28 MB total; ~12 MB free with nothing but our streamer at 640x480 |
+| RAM | 28 MB total; ~12 MB free with only the streamer running at 640x480 |
 | Flash | jffs2 on `/dev/mtdblock5` → `/mnt/spinand` (3.7 MB, 2.8 MB free before install); rootfs is a RAM disk (`root=/dev/ram0`), so `/`, `/lib`, `/etc` changes vanish on reboot |
 | Sensor | **Sonix USB UVC camera module** `0c45:6360` (chip id 0x90) behind an internal USB hub `058f:6254`. `/dev/video0` = MJPEG/YUV, `/dev/video1` = H.264 (rejects every format the vendor tool offers; unused) |
 | Also on USB | `058f:6366` mass-storage reader (the SD slot) |
@@ -19,7 +19,7 @@ firmware details, and pitfalls to avoid.
 
 - Linux **2.6.21** (2013 build), uClibc 0.9.28, BusyBox 1.12.1 (no `nc`, `mkfifo`,
   `timeout`, `strings`, `head`).
-- Only service exposed: **telnet (23)**, `admin`/`admin`, root shell.
+- Stock service exposed: **telnet (23)**, factory-default login `admin`/`admin`, root shell.
 - UDP listeners from the cloud client: 5000 (`LANPORT`), 543, 39, 2627, 357.
 - Vendor stack in `/mnt/sif` (= `/mnt/spinand/sif`):
   - `bin/hkipc <device-id> <device-password> lixun.scc21.net 8080` — P2P cloud client;
@@ -31,7 +31,7 @@ firmware details, and pitfalls to avoid.
     (`-c5 -s 640x480 -f mjpg -S /dev/video0` → `frame-%06u.bin`), but cannot stream, and
     at 720p it mmaps 8 full-size buffers and gets OOM-killed. Option values must be
     attached (`-c60`, not `-c 60`).
-  - `bin/ftpserver`, `bin/CKRate`, `bin/hk-update`, `bin/ls_user` — unused by us.
+  - `bin/ftpserver`, `bin/CKRate`, `bin/hk-update`, `bin/ls_user` — unused by this project.
   - Config: `hkclient.conf`, `net.cfg`, `video.cfg`, `neck.cfg` (`bit1x=2021 bit1y=539`),
     `ircut.cfg`, `sdvideo.cfg`, `nas.conf`.
 - `/bin/goahead` is the stock Ralink router web UI (GoAhead-Webs 2.x). Web root
@@ -42,7 +42,7 @@ firmware details, and pitfalls to avoid.
   into `/etc/init.d`, then `rundir /etc/init.d` **sources every executable file** there.
   `55hk.sh` started `runhkipc`; `scc_start.sh` starts `crond` with `/mnt/sif/cron`,
   which runs `hk-watch.sh` every minute: it executes every file in `/tmp/hk-watch` with
-  `sh file &` (we use this as our free restart-on-crash mechanism).
+  `sh file &` (used by this project for automatic service recovery).
 - Watchdog: `/bin/watchdog` is a trivial open/write/sleep loop on `/dev/watchdog`.
   `hkipc` strings include `killall watchdog; reboot`.
 
@@ -94,7 +94,7 @@ and wall-clock-independent capture timeouts without interrupting live capture.
    there with its exec bit ran the original script anyway. Keep backups elsewhere
    (`/mnt/sif/55hk.sh.orig.bak`).
 3. **After a reboot the camera may not come back on DHCP.** Happened once (needed a
-   factory reset — which does *not* clear the jffs2 changes we rely on, it just reruns
+   factory reset — which does *not* clear the project's jffs2 changes, it just reruns
    setup); the next three reboots were fine. Minimise reboots.
 4. **PowerShell/Windows quoting**: inner quotes passed to `node script.js "..."` get
    stripped; `grep -E 'a|b'` became `grep -E a | b`, which ran `watchdog` and
@@ -102,9 +102,9 @@ and wall-clock-independent capture timeouts without interrupting live capture.
 5. **`/bin/neck` recalibrates on start** and drove the head to its counter-clockwise
    stop; afterwards it reports garbage ranges and segfaults for every argument form tried.
 
-## What we installed
+## Initial installation
 
-Two static binaries of our own, cross-compiled on Windows with Zig
+Two project binaries, cross-compiled on Windows with Zig
 (`zig cc -target mipsel-linux-musleabi -mcpu=mips32 -Os -static`): `mjpgd` (streamer)
 and `hkctl` (PTZ / IR-cut / Wi-Fi control API, plus a `daemon` helper = setsid + double
 fork, because the stock BusyBox has neither `setsid` nor `nohup` and daemons started
@@ -232,8 +232,8 @@ table: Ch, SSID at col 4/33 wide, BSSID at 37, Security at 57, Signal% at 80).
 Stock behaviour: `globefish` reads `WifiEnable/WifiSSID/WifiPASS/...` from
 `/mnt/sif/net.cfg` and has a `StartWifiAdhoc` mode that advertises `AP(<id>)` at
 192.168.10.222 — the vendor app's setup channel; ad-hoc is unusable from modern
-phones/Windows. We bypass globefish for Wi-Fi: `wifi.sh` applies `/mnt/sif/owrt/wifi.conf`
-via iwpriv and runs `udhcpc -i ra0` with our own handler (`wifi-dhcp.sh`), which only
+phones/Windows. The project bypasses globefish for Wi-Fi: `wifi.sh` applies `/mnt/sif/owrt/wifi.conf`
+via iwpriv and runs `udhcpc -i ra0` with a custom handler (`wifi-dhcp.sh`), which only
 installs a default route via Wi-Fi when `eth2` has no address. `hkctl serve` exposes
 `/wifi/scan|status|join`; `56mjpg.sh` runs `wifi.sh` 20 s after boot.
 
@@ -241,11 +241,11 @@ Site survey detected a 2.4 GHz WPA2PSK/AES router at 100 % signal during testing
 
 globefish interference (found after the first reboot with Wi-Fi configured): the link
 came up fine at boot (+20 s) and was torn down within minutes — `ra0` left up with no
-address, `connStatus:Disconnected`, our udhcpc gone. globefish's strings show
-`killall udhcpc` (kills every DHCP client, ours included) and an ad-hoc setup fallback
+address, `connStatus:Disconnected`, and the project's udhcpc process gone. globefish's strings show
+`killall udhcpc` (kills every DHCP client, including the project's) and an ad-hoc setup fallback
 (`iwpriv ra0 set NetworkType=Adhoc`, `ifconfig ra0 192.168.10.222 up`) it applies when
-its own `net.cfg` says `WifiEnable=0` — that 192.168.10.222 is the "self-claimed"
-address the router showed. Countermeasures in `wifi.sh`: the DHCP client is started as
+its own `net.cfg` says `WifiEnable=0` — 192.168.10.222 is the vendor's fixed setup
+address. Countermeasures in `wifi.sh`: the DHCP client is started as
 `/bin/busybox udhcpc …` (killall matches the command name, so it survives), and
 `wifi.sh check` runs every minute from `/tmp/hk-watch/wifi` and re-joins when the link
 or the address is lost. Observed stable for 5+ minutes after that; a reboot test is
@@ -278,7 +278,7 @@ mkdosfs build a ~8 MB FAT in RAM and get OOM-killed.
 
 Clock: no RTC, boots at 2000-01-01. `ntpclient -s -h pool.ntp.org -c 1` works (DNS via
 8.8.8.8); `sd.sh check` runs it until the year looks sane. `TZ` is exported by start.sh
-(POSIX string, default Eastern) so file names are local time.
+(a configurable POSIX timezone string) so file names use the configured local time.
 
 Motion detection: `SONiX_UVC_TestAP /dev/video0 --motionget-result` prints
 `golllll <mask>` (9-bit zone mask, 0 = none) and works while another process streams;
